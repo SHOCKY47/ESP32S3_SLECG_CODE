@@ -20,8 +20,12 @@
 #define BOARD_ADS_START_GPIO        GPIO_NUM_7
 #define BOARD_ADS_PWDN_GPIO         GPIO_NUM_8
 
-/* 指示灯：低电平点亮 */
-#define BOARD_LED_GREEN_GPIO        GPIO_NUM_10
+/* 用户按键：按下时拉低 */
+#define BOARD_BTN_GPIO              GPIO_NUM_18
+
+/* 双色指示灯：低电平点亮；绿=有线/UART，蓝=蓝牙/BLE */
+#define BOARD_LED_GREEN_GPIO        GPIO_NUM_41
+#define BOARD_LED_BLUE_GPIO         GPIO_NUM_42
 
 #define BOARD_LED_ON(gpio)          gpio_set_level((gpio), 0)
 #define BOARD_LED_OFF(gpio)         gpio_set_level((gpio), 1)
