@@ -61,6 +61,11 @@ venv/
 .venv/
 env/
 
+# Cursor local state (keep shared project skills if explicitly added)
+.cursor/*
+!.cursor/skills/
+!.cursor/skills/**
+
 # Language Servers
 .clangd/
 .ccls-cache/

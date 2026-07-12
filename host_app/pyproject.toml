@@ -1,0 +1,22 @@
+[project]
+name = "slecg-host"
+version = "1.0.0"
+description = "SLECG ECG host application — serial/BLE receiver and waveform display"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "PyQt6>=6.6",
+    "pyqtgraph>=0.13",
+    "pyserial>=3.5",
+    "bleak>=0.21",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+slecg-host = "main:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

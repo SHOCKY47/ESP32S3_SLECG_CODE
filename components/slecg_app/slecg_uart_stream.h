@@ -10,10 +10,13 @@
 
 #include "esp_err.h"
 
-/** @brief 向 UART0 写入原始帧（控制台已占用 UART 驱动） */
+/** @brief 进入二进制流前调用：关 CRLF、stdout 无缓冲 */
+void slecg_uart_stream_prepare_binary(void);
+
+/** @brief 向 UART0 写入原始帧（经 stdout/VFS，与 ESP_LOG 同通道） */
 esp_err_t slecg_uart_stream_write(const uint8_t *data, size_t len);
 
-/** @brief 清空 UART0 TX 缓冲（进入采集前调用） */
+/** @brief 排空尚未写出的文本（进入采集前调用） */
 void slecg_uart_stream_flush(void);
 
 /** @brief 关闭 UART0 日志输出（采集时避免污染数据流） */

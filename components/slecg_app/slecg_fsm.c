@@ -8,6 +8,7 @@
 #include "ble_slecg.h"
 #include "esp_log.h"
 #include "freertos/task.h"
+#include "slecg_ecg.h"
 #include "slecg_led.h"
 #include "slecg_nvs.h"
 #include "slecg_proto_types.h"
@@ -45,11 +46,16 @@ static void send_ack(uint8_t orig_type)
 
 static void apply_uart_log_policy(void)
 {
+    /* 仅 UART 采集时关日志，避免污染二进制流；BLE 采集时 UART 专供 idf_monitor */
     if (s_runtime->transport == SLECG_TRANSPORT_UART &&
         s_runtime->acq == SLECG_ACQ_RUNNING) {
+        ESP_LOGI(TAG, "UART 采集中：即将关闭 ESP_LOG（避免污染 ECG 二进制）");
         slecg_uart_stream_logs_disable();
     } else {
         slecg_uart_stream_logs_enable();
+        if (s_runtime->transport == SLECG_TRANSPORT_BLE) {
+            ESP_LOGI(TAG, "BLE 模式：UART 日志保持开启，可用 idf_monitor 调试 ADS/SPI");
+        }
     }
 }
 
@@ -113,11 +119,26 @@ static void do_start_acq(uint8_t orig_type, bool from_ble)
     }
 
     if (s_runtime->transport == SLECG_TRANSPORT_UART) {
+        slecg_uart_stream_prepare_binary();
         slecg_uart_stream_flush();
     }
 
+    /* 先拉高 PWDN，再读寄存器；否则 BLE sleep 后采集前诊断/数据会全 0 */
+    ads129x_ensure_powered();
+    ESP_LOGI(TAG, "采集启动诊断: ads_ready=%d ever_started=%d from_ble=%d",
+             (int)s_runtime->ads_ready,
+             (int)s_runtime->ads_ever_started,
+             (int)from_ble);
+    ads129x_log_pins("采集前");
+    (void)ads129x_log_registers("采集前");
+
+    /* 采集前强制退出掉电，避免 BLE sleep 把 PWDN 拉低后读数全 0 */
+    /* 具体拉高在 ads129x_init_start/start 内完成 */
+
+    slecg_ecg_reset_stats();
     ret = ads_start_hw();
     if (ret != 0) {
+        ESP_LOGE(TAG, "ADS 启动失败: %d", ret);
         s_runtime->error_code = SLECG_ERR_SPI;
         if (from_ble) {
             send_nack(orig_type, SLECG_ERR_SPI);
@@ -129,13 +150,17 @@ static void do_start_acq(uint8_t orig_type, bool from_ble)
 
     s_runtime->acq = SLECG_ACQ_RUNNING;
     s_runtime->error_code = SLECG_ERR_NONE;
+
+    /* 先打日志，再按策略关/留日志 */
+    ESP_LOGI(TAG, "采集已开始，传输=%s sample_rate=%u SPI_DATA=%u",
+             s_runtime->transport == SLECG_TRANSPORT_UART ? "UART" : "BLE",
+             (unsigned)ADS129X_SAMPLE_RATE_HZ,
+             (unsigned)ADS129X_SPI_FREQ_DATA);
     apply_uart_log_policy();
 
     if (from_ble) {
         send_ack(orig_type);
     }
-    ESP_LOGI(TAG, "采集已开始，传输=%s",
-             s_runtime->transport == SLECG_TRANSPORT_UART ? "UART" : "BLE");
 }
 
 static void do_stop_acq(uint8_t orig_type, bool from_ble)
@@ -160,6 +185,8 @@ static void do_stop_acq(uint8_t orig_type, bool from_ble)
         send_ack(orig_type);
     }
     ESP_LOGI(TAG, "采集已停止");
+    /* 日志恢复后打印统计，便于确认是否真正读到/发出 ECG */
+    slecg_ecg_log_stats();
 }
 
 static void toggle_acq_by_button(void)
@@ -265,6 +292,11 @@ void slecg_fsm_set_error(uint8_t error_code)
     if (s_runtime != NULL) {
         s_runtime->error_code = error_code;
     }
+}
+
+uint16_t slecg_fsm_peek_ecg_seq(void)
+{
+    return (s_runtime != NULL) ? s_runtime->ecg_seq : 0;
 }
 
 uint16_t slecg_fsm_next_ecg_seq(void)

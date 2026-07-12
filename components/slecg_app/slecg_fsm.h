@@ -19,6 +19,9 @@ const slecg_runtime_t *slecg_fsm_get_runtime(void);
 /** @brief 更新全局 error_code */
 void slecg_fsm_set_error(uint8_t error_code);
 
+/** @brief 查看当前 ECG 包序号（不递增） */
+uint16_t slecg_fsm_peek_ecg_seq(void);
+
 /** @brief 递增 ECG 包序号并返回发送前的 seq */
 uint16_t slecg_fsm_next_ecg_seq(void);
 
