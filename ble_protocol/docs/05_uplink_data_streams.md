@@ -1,136 +1,41 @@
 # 05 — 上行数据流
 
-设备通过 GATT 特征 **0xFFE2（CMD_TX）** 以 Notify 方式向上位机发送数据帧。
+BLE设备通过`0xFFE2` Notify向上位机发送协议帧；UART模式使用相同帧格式，但采集期间只发送ECG_DATA。
 
-## 1. 上行包类型与频率
+| TYPE | 名称 | 频率 | 帧长 | 条件 |
+|------|------|------|------|------|
+| `0x01` | ACK | 按需 | 9 B | 命令成功 |
+| `0x02` | NACK | 按需 | 9 B | 命令被拒绝 |
+| `0x20` | ECG_DATA | 10 Hz | 65 B | RUNNING，每25点 |
+| `0x30` | DEVICE_STATUS | 1 Hz | 19 B | BLE连接后 |
+| `0x40` | IMU_DATA | 50 Hz | 27 B | 预留，当前不发送 |
 
-| TYPE | 名称 | 频率 | 帧长 | 触发条件 |
-|------|------|------|------|----------|
-| `0x01` | ACK | 按需 | 10 B | 响应 START/STOP |
-| `0x02` | NACK | 按需 | 10 B | 指令拒绝 |
-| `0x20` | ECG_DATA | **20 Hz** | 66 B | RUNNING 状态，每 25 样本 |
-| `0x30` | DEVICE_STATUS | **1 Hz** | 20 B | 周期 + REQ_STATUS |
-| `0x40` | IMU_DATA | **50 Hz**（预留） | 28 B | IMU 启用后 |
-| `0x50` | BATTERY_ADC | **0.2 Hz** | 13 B | 每 5 s |
+## ECG_DATA
 
-## 2. 数据流优先级
+- DRDY以250 Hz产生样本。
+- 每25点组成一帧，因此每100 ms发送一包。
+- `seq`用于检测丢包，uint16回绕。
+- `ts_ms`表示本包首样本的设备时间戳。
+- `loff`表示导联脱落状态。
 
-```
-ECG_DATA (最高，20 Hz) > IMU_DATA (50 Hz, 预留) > DEVICE_STATUS (1 Hz) > BATTERY_ADC (0.2 Hz)
-```
+详见[ECG_DATA字段](../packets/ecg_data.md)。
 
-Notify 发送冲突时，优先保证 ECG_DATA；STATUS/BATTERY 可跳过一拍。
+## DEVICE_STATUS
 
-## 3. ECG_DATA 流（0x20）
+- BLE连接后每秒发送一次。
+-收到REQ_STATUS时立即额外发送。
+- 包含采集、BLE、ADS就绪状态，错误码、采样率、序号、运行时间和固件版本。
 
-### 3.1 发送条件
+详见[DEVICE_STATUS字段](../packets/device_status.md)。
 
-- 采集状态机处于 **RUNNING**
-- 环形缓冲累积 **25** 个 `ch1_value` 样本
-- BLE 已连接且 CCCD 已开启
+## 发送优先级
 
-### 3.2 时序
-
-- 500 Hz 采样 → 每 50 ms 发 1 包 → **20 包/s**
-- 每包包含连续 25 个样本，无间隙、无重叠
-
-### 3.3 丢包检测
-
-- 上位机根据 `seq` 字段检测跳号
-- `seq` 为 uint16，溢出后从 0 回绕
-
-详见 [../packets/ecg_data.md](../packets/ecg_data.md)
-
-## 4. DEVICE_STATUS 流（0x30）
-
-### 4.1 发送条件
-
-- BLE 连接后持续发送（无论是否采集中）
-- 收到 **REQ_STATUS** 时立即额外发一包
-
-### 4.2 用途
-
-- 显示连接/采集/导联状态
-- 监控错误码
-- 同步 ECG 包序号与固件版本
-
-详见 [../packets/device_status.md](../packets/device_status.md)
-
-## 5. IMU_DATA 流（0x40，预留）
-
-### 5.1 当前阶段
-
-- **固件不发送** IMU_DATA
-- 上位机解析器应识别 TYPE `0x40` 但不报错
-- 协议格式已定义，待 LSM6DS3TR 驱动就绪后启用
-
-### 5.2 规划参数
-
-- 传感器：LSM6DS3TR（6 轴 IMU + 温度）
-- 频率：50 Hz
-- 与 ECG 时间戳均基于 `esp_timer` 毫秒计数
-
-详见 [../packets/imu_data.md](../packets/imu_data.md)
-
-## 6. BATTERY_ADC 流（0x50）
-
-### 6.1 发送条件
-
-- BLE 连接后每 **5 s** 发送
-- 与采集状态无关
-
-### 6.2 硬件
-
-- ADC 输入：`BOARD_BAT_ADC_GPIO`（GPIO1）
-- 分压系数待硬件确认，文档中留占位公式
-
-详见 [../packets/battery_adc.md](../packets/battery_adc.md)
-
-## 7. 上行带宽汇总
-
-| 场景 | 包类型 | 估算带宽 |
-|------|--------|----------|
-| 空闲（未采集） | STATUS + BATTERY | ≈ 22 B/s |
-| 采集中 | ECG + STATUS + BATTERY | ≈ 1.35 KB/s |
-| 全功能（含 IMU） | 全部 | ≈ 2.75 KB/s |
-
-详见 [02_throughput_analysis.md](02_throughput_analysis.md)。
-
-## 8. 上位机接收架构建议
-
-```mermaid
-flowchart LR
-    Notify[BLE Notify Callback]
-    Sync[Frame Sync A5 5A]
-    Dispatch[TYPE Dispatch]
-    ECG[ECG Parser]
-    Stat[Status Handler]
-    IMU[IMU Handler]
-    Bat[Battery Handler]
-    Ack[ACK Handler]
-
-    Notify --> Sync --> Dispatch
-    Dispatch --> ECG
-    Dispatch --> Stat
-    Dispatch --> IMU
-    Dispatch --> Bat
-    Dispatch --> Ack
+```text
+ECG_DATA > DEVICE_STATUS > IMU_DATA（预留）
 ```
 
-## 9. 发送失败处理（固件侧，待实现）
+ECG发送失败时丢弃当前包并计入发送统计，不阻塞后续DRDY读取；持续错误通过DEVICE_STATUS上报。
 
-| 场景 | 策略 |
-|------|------|
-| `ble_slecg_send_notify` 返回失败 | 丢弃当前 ECG 包 |
-| 连续失败 | 置 STATUS `error_code=3` |
-| STATUS/BATTERY 发送失败 | 下一周期重试，不阻塞 ECG |
+## 上位机解析
 
-## 10. 相关文档
-
-| 文档 | 内容 |
-|------|------|
-| [../packets/ecg_data.md](../packets/ecg_data.md) | ECG 包详解 |
-| [../packets/device_status.md](../packets/device_status.md) | 状态包详解 |
-| [../packets/imu_data.md](../packets/imu_data.md) | IMU 预留格式 |
-| [../packets/battery_adc.md](../packets/battery_adc.md) | 电池包详解 |
-| [../PACKET_FIELD_TABLE.md](../PACKET_FIELD_TABLE.md) | 完整字段表 |
+上位机使用增量缓存搜索`A5 5A`，并按传输模式限制合法TYPE和固定PAYLOAD长度。遇到伪帧头、非法长度或帧尾错误时立即继续搜索下一同步字，从而避免必须断开重连。

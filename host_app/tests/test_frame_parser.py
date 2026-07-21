@@ -75,3 +75,13 @@ def test_invalid_footer_resync():
     parser = FrameParser()
     frames = parser.feed(bytes(bad) + good)
     assert any(f.type == SLECG_TYPE_ECG_DATA for f in frames)
+
+
+def test_strict_length_rejects_fake_header_without_waiting():
+    """文本/噪声伪造大长度时，应立即跳到紧随其后的真实 ECG 帧。"""
+    fake = bytes.fromhex("A5 5A 20 F0 00") + b"noise"
+    good = _build_ecg_example_frame()
+    parser = FrameParser(expected_lengths={SLECG_TYPE_ECG_DATA: SLECG_ECG_PAYLOAD_LEN})
+    frames = parser.feed(fake + good)
+    assert len(frames) == 1
+    assert frames[0].type == SLECG_TYPE_ECG_DATA

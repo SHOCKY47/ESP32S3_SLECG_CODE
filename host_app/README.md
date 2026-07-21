@@ -1,128 +1,100 @@
-# SLECG Host — Python 上位机
+# SLECG Host
 
-ESP32S3 SL-ECG 设备的桌面端接收与波形显示程序。支持 **串口 (UART)** 与 **蓝牙 (BLE)** 两种数据来源，解析 SLECG v1.0 协议并实时绘制 500 Hz 心电波形。
+> 面向 ESP32S3 SL-ECG 的桌面端监护与实验工具：一边保留原始波形，一边完成显示优化、自动录波、R 峰检测和心率估计。
 
 ## 功能
 
-- 串口 / 蓝牙传输方式切换，端口与设备列表刷新
-- 流式帧解析（`A5 5A … 5A A5`），ECG_DATA (`0x20`) 实时曲线
-- BLE 模式：START / STOP / REQ_STATUS 远程控制
-- DEVICE_STATUS 状态面板（BLE）
-- CSV 录制（含 raw、mV、seq、时间戳）
-- **点击 Y 轴** 在 raw int16 与 mV 显示之间切换
-
-## 环境要求
-
-- Python 3.10+
-- Windows / macOS / Linux
-- BLE 功能需系统蓝牙可用（Windows 10+ 内置蓝牙栈）
+- UART 115200 8N1 与 BLE GATT 双传输
+- 严格长度校验的增量帧解析与自动重同步
+- 原始 / 优化处理后双画布，横轴联动
+- 5 秒实时窗口，空格冻结但不停止接收与保存
+- 停止、冻结与回放状态下拖动横轴查看历史
+- `0.5–35 Hz` 零相位 Butterworth + Savitzky–Golay 显示优化
+- Pan–Tompkins 思路 R 峰检测与 RR 心率估计
+- 自动保存 `testdata/YYYYMMDD_HHMM.csv`
+- 中文 / English 即时切换
+- 黑绿深色 / 白橙浅色主题
 
 ## 安装
 
 ```bash
-cd host_app
-python -m venv .venv
-
-# Windows
-.venv\Scripts\activate
-
-# macOS / Linux
+python3 -m venv .venv
 source .venv/bin/activate
-
 pip install -r requirements.txt
 ```
 
-## 运行
+Windows：
+
+```powershell
+.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+## 启动
 
 ```bash
-python main.py
+.venv/bin/python main.py
 ```
 
-## 使用说明
+## 使用
 
-### 串口模式（设备绿灯）
+### UART
 
-1. 确认设备处于 **UART 模式**（绿灯常亮，未采集）
-2. 选择 **串口 (UART)**，刷新并选择 COM 口，点击 **连接**
-3. **单击设备按键** 开始/停止采集（上位机无法远程启停）
-4. 波形区实时显示；可选 **录制 CSV**
+选择串口设备并连接，然后使用采集设备的实体按键开始或停止。UART模式下上位机只接收数据，不远程启停。
 
-串口参数：**115200 8N1**
+### BLE
 
-### 蓝牙模式（设备蓝灯）
+扫描并连接 `ESP_SLECG`。连接成功后可使用 START、STOP、STATUS，也可以继续使用设备实体按键。
 
-1. 设备 **长按 3 s** 切换到 BLE 模式（蓝灯常亮）
-2. 选择 **蓝牙 (BLE)**，点击 **刷新列表**，选择 `ESP_SLECG`
-3. 点击 **连接**（自动开启 GATT Notify）
-4. 点击 **开始采集** 或发送 START；**停止采集** 发送 STOP
-5. **请求状态** 获取 DEVICE_STATUS
+### 画布
 
-GATT 映射：
+| 操作 | 结果 |
+|------|------|
+| 点击 Y 轴 | raw / mV 切换 |
+| 空格 | 冻结 / 恢复实时显示 |
+| 拖动横轴 | 冻结、停止或回放时浏览历史 |
+| 打开回放 | 读取 `testdata/*.csv` |
+| `EN / 中文` | 切换语言 |
+| `☀ / ☾` | 切换主题 |
 
-| UUID | 方向 | 用途 |
-|------|------|------|
-| `0xFFE0` | Service | SLECG 服务 |
-| `0xFFE1` | Host → Device | 下行指令 Write |
-| `0xFFE2` | Device → Host | 上行数据 Notify |
+优化画布上的圆点是检测到的 R 峰；顶部心率取最近有效 RR 间期的中位数。该结果用于实验显示，不作为医疗诊断。
 
-## 协议参考
+## 数据文件
 
-详见仓库 [`ble_protocol/`](../ble_protocol/README.md)。
+采集首帧到达时自动开始记录：
 
-ECG 包：每帧 25 样本，20 帧/秒，500 Hz。
-
-## mV 换算
-
-默认：`Vref = 4.033 V`，`PGA gain = 1`，`shift=4`；数字滤波：0.2 Hz 高通 + 50 Hz 陷波（冲顶可复现联调版本）。波形 Y 轴按数据自适应。
-
-```
-mV ≈ raw × (Vref × 1000) / (gain × 32768)
+```text
+testdata/20260722_1430.csv
 ```
 
-此为近似值，精确标定需结合硬件分压与电极体系。
+CSV字段：
+
+```text
+timestamp_ms,seq,sample_index,raw_int16,mv,loff
+```
+
+`testdata/`、`logs/`、`recordings/`均属于运行产物并被Git忽略。
 
 ## 测试
 
 ```bash
-cd host_app
-pytest tests/ -v
+.venv/bin/pytest tests -q
 ```
 
-## 目录结构
+测试覆盖协议粘包/拆包、伪帧头恢复、ECG载荷、完整历史缓存、CSV回读、优化滤波和合成ECG心率检测。
 
-```
+## 目录
+
+```text
 host_app/
-├── main.py                 # 入口
+├── main.py
+├── requirements.txt
 ├── slecg_host/
-│   ├── protocol/           # 帧解析与载荷
-│   ├── transport/          # 串口 / BLE
-│   ├── ecg/                # 缓冲、换算、录制
-│   └── ui/                 # PyQt6 界面
+│   ├── ecg/          # 缓冲、换算、记录、优化处理、R峰检测
+│   ├── protocol/     # 协议常量、帧解析和载荷
+│   ├── transport/    # UART与BLE
+│   └── ui/           # 主窗口、双画布、主题和面板
 └── tests/
 ```
 
-## 日志
-
-启动后日志同时输出到：
-
-- **终端 stderr**（INFO）
-- **`host_app/logs/slecg_host_YYYYMMDD.log`**（DEBUG）
-
-连接成功后状态栏会实时显示：`RX 字节数 | 帧数 | ECG包数`。
-
-## 常见问题
-
-| 问题 | 建议 |
-|------|------|
-| 一直显示「正在连接…」 | **先退出 idf_monitor / 其它串口程序**，再点连接。同一 USB 口不能双开 |
-| 已连接但无波形 | 确认设备**绿灯闪烁**（采集中）。常亮=未采集，此时 UART 只有文本日志，没有 ECG 帧 |
-| 串口无数据 | 确认 115200；刷新后选 `/dev/cu.wchusbserial*` 或对应 COM |
-| 扫不到 BLE | 确认蓝灯常亮；靠近设备；Windows 需开启蓝牙 |
-| 曲线平坦 | 检查导联连接；查看 loff 状态 |
-| mV 数值偏差 | 在 `EcgConverter` 中调整 Vref/gain |
-
-## 录制文件
-
-CSV 默认保存至 `host_app/recordings/ecg_YYYYMMDD_HHMMSS.csv`。
-
-列：`timestamp_ms, seq, sample_index, raw_int16, mv, loff`
+完整固件、协议与故障排查说明见仓库根目录 [`README.md`](../README.md)。

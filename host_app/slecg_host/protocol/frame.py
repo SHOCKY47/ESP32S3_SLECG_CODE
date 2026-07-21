@@ -42,13 +42,23 @@ def build_frame(frame_type: int, payload: bytes = b"") -> bytes:
 class FrameParser:
     """Incremental byte-stream frame parser."""
 
-    def __init__(self, max_cache: int = 8192) -> None:
+    def __init__(
+        self,
+        max_cache: int = 8192,
+        expected_lengths: dict[int, int] | None = None,
+    ) -> None:
         # 默认 8KB：覆盖突发二进制流；过小会导致半包被截断、长期无法同步
         self._cache = bytearray()
         self._max_cache = max(max_cache, SLECG_FRAME_MAX_PAYLOAD + SLECG_FRAME_OVERHEAD)
+        self._expected_lengths = dict(expected_lengths) if expected_lengths else None
 
     def reset(self) -> None:
         self._cache.clear()
+
+    def set_expected_lengths(self, expected_lengths: dict[int, int] | None) -> None:
+        """限制合法入站帧，避免噪声伪帧头让解析器长期等待错误长度。"""
+        self._expected_lengths = dict(expected_lengths) if expected_lengths else None
+        self.reset()
 
     @property
     def cache_size(self) -> int:
@@ -97,6 +107,13 @@ class FrameParser:
         if payload_len > SLECG_FRAME_MAX_PAYLOAD:
             del cache[0]
             return None
+
+        if self._expected_lengths is not None:
+            expected = self._expected_lengths.get(cache[2])
+            if expected is None or payload_len != expected:
+                # 当前同步字节属于噪声；丢一个字节后立即寻找下一个 A5 5A。
+                del cache[0]
+                return None
 
         total = payload_len + SLECG_FRAME_OVERHEAD
         if length < total:

@@ -33,8 +33,7 @@
 | 1 | BLE_CONNECTED | BLE 已连接 | 未连接 |
 | 2 | ADS129X_READY | ADS129x 初始化成功 | 未就绪 |
 | 3 | IMU_READY | LSM6DS3 就绪（预留） | 未就绪 / 未启用 |
-| 4 | BATTERY_LOW | 电池低电量 | 电量正常 |
-| 5~7 | — | 保留 | — |
+| 4~7 | — | 保留 | — |
 
 示例：`state = 0x07` → 采集中 + 已连接 + ADS129x 就绪。
 
@@ -86,7 +85,7 @@
 
 ## 5. Hex 示例
 
-采集中、已连接、ADS129x 就绪、无错误、500 Hz、ecg_seq=42、uptime=60000、v1.0：
+采集中、已连接、ADS129x 就绪、无错误、250 Hz、ecg_seq=42、uptime=60000、v1.0：
 
 ```
 state      = 0x07 (bit0+1+2)

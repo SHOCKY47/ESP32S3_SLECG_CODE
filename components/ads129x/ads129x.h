@@ -253,7 +253,7 @@
 
 #define ADS129X_CONFIG1_125SPS       0x00   /* 125 SPS */
 #define ADS129X_CONFIG1_250SPS       0x01   /* 250 SPS */
-#define ADS129X_CONFIG1_500SPS       0x02   /* 500 SPS（默认） */
+#define ADS129X_CONFIG1_500SPS       0x02   /* 500 SPS（可选） */
 #define ADS129X_CONFIG1_1000SPS      0x03   /* 1000 SPS */
 #define ADS129X_CONFIG1_2000SPS      0x04   /* 2000 SPS */
 #define ADS129X_CONFIG1_4000SPS      0x05   /* 4000 SPS */
@@ -1092,12 +1092,21 @@
  * 每个采样点仍使用定点整数运算。
  */
 #ifndef ADS129X_HIGHPASS_CUTOFF_HZ
-#define ADS129X_HIGHPASS_CUTOFF_HZ               0.2f
+#define ADS129X_HIGHPASS_CUTOFF_HZ               0.4f
+#endif
+
+/* 二阶 Butterworth 数字低通，适用于监护型单导联 ECG。 */
+#ifndef ADS129X_LOWPASS_ENABLE
+#define ADS129X_LOWPASS_ENABLE                   1
+#endif
+
+#ifndef ADS129X_LOWPASS_CUTOFF_HZ
+#define ADS129X_LOWPASS_CUTOFF_HZ                40.0f
 #endif
 
 /*
  * 50 Hz 工频陷波（数字 IIR）。ADS1291 芯片无内置 notch，在驱动读帧路径中实现。
- * 处理顺序：高通 → 陷波 → 右移压缩为 int16。
+ * 处理顺序：高通 → 陷波 → 低通 → 右移压缩为 int16。
  */
 #ifndef ADS129X_NOTCH_ENABLE
 #define ADS129X_NOTCH_ENABLE                     1

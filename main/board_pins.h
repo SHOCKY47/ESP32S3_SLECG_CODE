@@ -17,9 +17,6 @@
  *   PWDN → GPIO13
  */
 
-/* 电池电压采集（本阶段不启用） */
-#define BOARD_BAT_ADC_GPIO          GPIO_NUM_1
-
 /* ADS1291 控制与 SPI */
 #define BOARD_ADS_DRDY_GPIO         GPIO_NUM_3
 #define BOARD_ADS_MISO_GPIO         GPIO_NUM_46  /* ADS DOUT */

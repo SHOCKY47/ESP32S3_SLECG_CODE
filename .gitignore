@@ -56,6 +56,11 @@ __pycache__/
 *.egg-info/
 dist/
 
+# Host application runtime data
+host_app/testdata/
+host_app/logs/
+host_app/recordings/
+
 # Virtual environment folders
 venv/
 .venv/

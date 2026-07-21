@@ -26,6 +26,8 @@ class ConnectionPanel(QGroupBox):
 
     def __init__(self, parent=None) -> None:  # noqa: ANN001
         super().__init__("连接", parent)
+        self._language = "zh"
+        self._theme = "dark"
         self._connected = False
         self._connecting = False
 
@@ -46,22 +48,18 @@ class ConnectionPanel(QGroupBox):
 
         self._hint = QLabel()
         self._hint.setWordWrap(True)
-        self._hint.setStyleSheet("color: #666;")
-
-        mode_row = QHBoxLayout()
-        mode_row.addWidget(self._serial_radio)
-        mode_row.addWidget(self._ble_radio)
-        mode_row.addStretch()
-
-        btn_row = QHBoxLayout()
-        btn_row.addWidget(self._refresh_btn)
-        btn_row.addWidget(self._connect_btn)
-        btn_row.addWidget(self._disconnect_btn)
+        self._hint.setStyleSheet("color: #84a9cc;")
 
         layout = QVBoxLayout(self)
-        layout.addLayout(mode_row)
-        layout.addWidget(self._device_combo)
-        layout.addLayout(btn_row)
+        main_row = QHBoxLayout()
+        main_row.addWidget(self._serial_radio)
+        main_row.addWidget(self._ble_radio)
+        main_row.addSpacing(12)
+        main_row.addWidget(self._device_combo, stretch=1)
+        main_row.addWidget(self._refresh_btn)
+        main_row.addWidget(self._connect_btn)
+        main_row.addWidget(self._disconnect_btn)
+        layout.addLayout(main_row)
         layout.addWidget(self._hint)
 
         self._serial_radio.toggled.connect(self._on_mode_toggled)
@@ -69,6 +67,24 @@ class ConnectionPanel(QGroupBox):
         self._connect_btn.clicked.connect(self.connect_requested.emit)
         self._disconnect_btn.clicked.connect(self.disconnect_requested.emit)
         self._update_hint()
+
+    def set_language(self, language: str) -> None:
+        self._language = language
+        zh = language == "zh"
+        self.setTitle("设备连接" if zh else "DEVICE CONNECTION")
+        self._serial_radio.setText("串口 UART" if zh else "UART")
+        self._ble_radio.setText("蓝牙 BLE" if zh else "BLUETOOTH BLE")
+        self._refresh_btn.setText("刷新" if zh else "SCAN")
+        self._connect_btn.setText(
+            ("正在连接…" if zh else "CONNECTING…")
+            if self._connecting else ("连接" if zh else "CONNECT")
+        )
+        self._disconnect_btn.setText("断开" if zh else "DISCONNECT")
+        self._update_hint()
+
+    def set_theme(self, theme: str) -> None:
+        self._theme = theme
+        self._hint.setStyleSheet("color: #687684;" if theme == "light" else "color: #75b58a;")
 
     @property
     def transport_mode(self) -> TransportMode:
@@ -100,14 +116,14 @@ class ConnectionPanel(QGroupBox):
         self._connecting = connecting
         if connecting:
             self._connect_btn.setEnabled(False)
-            self._connect_btn.setText("正在连接…")
+            self._connect_btn.setText("正在连接…" if self._language == "zh" else "CONNECTING…")
             self._refresh_btn.setEnabled(False)
             self._serial_radio.setEnabled(False)
             self._ble_radio.setEnabled(False)
             self._device_combo.setEnabled(False)
             self._disconnect_btn.setEnabled(False)
         else:
-            self._connect_btn.setText("连接")
+            self._connect_btn.setText("连接" if self._language == "zh" else "CONNECT")
             if not self._connected:
                 self._connect_btn.setEnabled(True)
                 self._refresh_btn.setEnabled(True)
@@ -118,7 +134,7 @@ class ConnectionPanel(QGroupBox):
     def set_connected(self, connected: bool) -> None:
         self._connected = connected
         self._connecting = False
-        self._connect_btn.setText("连接")
+        self._connect_btn.setText("连接" if self._language == "zh" else "CONNECT")
         self._connect_btn.setEnabled(not connected)
         self._disconnect_btn.setEnabled(connected)
         self._serial_radio.setEnabled(not connected)
@@ -134,13 +150,16 @@ class ConnectionPanel(QGroupBox):
         self.transport_changed.emit(self.transport_mode)
 
     def _update_hint(self) -> None:
+        zh = self._language == "zh"
         if self.transport_mode == TransportMode.SERIAL:
-            self._hint.setText(
-                "串口模式：确认设备绿灯常亮；单击设备按键开始/停止采集。"
-                "上位机仅被动接收 ECG 数据，不支持远程启停。"
-            )
+            self._hint.setText((
+                "串口模式：使用设备按键开始/停止采集，上位机被动接收数据。"
+                if zh else
+                "UART mode: use the device button to start/stop; the host receives data passively."
+            ))
         else:
-            self._hint.setText(
-                "蓝牙模式：确认设备蓝灯常亮；连接后开启 Notify，"
-                "可通过下方按钮或设备按键控制采集。"
-            )
+            self._hint.setText((
+                "蓝牙模式：连接后可通过控制面板或设备按键启停采集。"
+                if zh else
+                "BLE mode: start or stop acquisition from the control panel or device button."
+            ))

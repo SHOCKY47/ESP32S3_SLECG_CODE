@@ -28,7 +28,6 @@
 #define SLECG_TYPE_ECG_DATA         0x20U
 #define SLECG_TYPE_DEVICE_STATUS    0x30U
 #define SLECG_TYPE_IMU_DATA         0x40U
-#define SLECG_TYPE_BATTERY_ADC      0x50U
 
 /* PAYLOAD 固定长度 */
 #define SLECG_ACK_PAYLOAD_LEN       2U
@@ -59,7 +58,6 @@
 #define SLECG_STATUS_BIT_BLE_CONNECTED  (1U << 1)
 #define SLECG_STATUS_BIT_ADS_READY      (1U << 2)
 #define SLECG_STATUS_BIT_IMU_READY      (1U << 3)
-#define SLECG_STATUS_BIT_BATTERY_LOW    (1U << 4)
 
 /* 固件版本：major<<8 | minor */
 #define SLECG_FW_VERSION            0x0100U

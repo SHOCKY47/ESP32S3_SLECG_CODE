@@ -17,7 +17,7 @@
 | *ALL* | * | foot_h | 5+LEN | — | 1 | uint8 | — | 固定 `0x5A` |
 | *ALL* | * | foot_l | 6+LEN | — | 1 | uint8 | — | 固定 `0xA5` |
 
-**帧总长度** = 8 + LEN 字节。
+**帧总长度** = 7 + LEN 字节。
 
 ---
 
@@ -34,7 +34,7 @@
 | ACK | 0x01 | result | 6 | 1 | 1 | uint8 | — | `0`=成功 |
 | ACK | 0x01 | foot | 7 | — | 2 | — | — | `5A A5` |
 
-**帧长** = 10 B | **PAYLOAD** = 2 B
+**帧长** = 9 B | **PAYLOAD** = 2 B
 
 ---
 
@@ -49,7 +49,7 @@
 | NACK | 0x02 | error | 6 | 1 | 1 | uint8 | — | 见错误码表 §3 |
 | NACK | 0x02 | foot | 7 | — | 2 | — | — | `5A A5` |
 
-**帧长** = 10 B | **PAYLOAD** = 2 B
+**帧长** = 9 B | **PAYLOAD** = 2 B
 
 ---
 
@@ -64,7 +64,7 @@
 | START_ACQ | 0x10 | flags | 6 | 1 | 1 | uint8 | — | bit0: IMU_SYNC(预留) |
 | START_ACQ | 0x10 | foot | 7 | — | 2 | — | — | `5A A5` |
 
-**帧长** = 10 B | **PAYLOAD** = 2 B
+**帧长** = 9 B | **PAYLOAD** = 2 B
 
 **flags 位定义：**
 
@@ -85,7 +85,7 @@
 | STOP_ACQ | 0x11 | reserved | 5 | 0 | 1 | uint8 | — | 固定 `0x00` |
 | STOP_ACQ | 0x11 | foot | 6 | — | 2 | — | — | `5A A5` |
 
-**帧长** = 9 B | **PAYLOAD** = 1 B
+**帧长** = 8 B | **PAYLOAD** = 1 B
 
 ---
 
@@ -98,7 +98,7 @@
 | REQ_STATUS | 0x12 | len | 3 | — | 2 | uint16 | LE | `0x0000` |
 | REQ_STATUS | 0x12 | foot | 5 | — | 2 | — | — | `5A A5` |
 
-**帧长** = 8 B | **PAYLOAD** = 0 B
+**帧长** = 7 B | **PAYLOAD** = 0 B
 
 ---
 
@@ -119,9 +119,9 @@
 | ECG_DATA | 0x20 | samples[24] | 61 | 58 | 2 | int16 | LE | 第 25 个 ECG 样本 |
 | ECG_DATA | 0x20 | foot | 63 | — | 2 | — | — | `5A A5` |
 
-**帧长** = 66 B | **PAYLOAD** = 58 B | **频率** = 20 Hz
+**帧长** = 65 B | **PAYLOAD** = 58 B | **频率** = 10 Hz
 
-**samples 来源：** `ads129x_sample_t.ch1_value`（500 Hz，int16）
+**samples 来源：** `ads129x_sample_t.ch1_value`（250 Hz，int16）
 
 ---
 
@@ -140,7 +140,7 @@
 | DEVICE_STATUS | 0x30 | fw_version | 15 | 10 | 2 | uint16 | LE | major<<8\|minor |
 | DEVICE_STATUS | 0x30 | foot | 17 | — | 2 | — | — | `5A A5` |
 
-**帧长** = 20 B | **PAYLOAD** = 12 B | **频率** = 1 Hz
+**帧长** = 19 B | **PAYLOAD** = 12 B | **频率** = 1 Hz
 
 ---
 
@@ -162,27 +162,9 @@
 | IMU_DATA | 0x40 | temp_raw | 23 | 18 | 2 | int16 | LE | 温度 raw（LSM6DS3） |
 | IMU_DATA | 0x40 | foot | 25 | — | 2 | — | — | `5A A5` |
 
-**帧长** = 28 B | **PAYLOAD** = 20 B | **频率** = 50 Hz（启用后）
+**帧长** = 27 B | **PAYLOAD** = 20 B | **频率** = 50 Hz（启用后）
 
 > **当前固件不发送。** 传感器：LSM6DS3TR。
-
----
-
-### 2.9 BATTERY_ADC（0x50）— 设备 → 上位机
-
-| 包名 | TYPE | 字段名 | 偏移(帧) | 偏移(PAYLOAD) | 长度(B) | 类型 | 字节序 | 取值/含义 |
-|------|------|--------|----------|---------------|---------|------|--------|-----------|
-| BATTERY_ADC | 0x50 | sync | 0 | — | 2 | — | — | `A5 5A` |
-| BATTERY_ADC | 0x50 | type | 2 | — | 1 | uint8 | — | `0x50` |
-| BATTERY_ADC | 0x50 | len | 3 | — | 2 | uint16 | LE | `0x0005`（5） |
-| BATTERY_ADC | 0x50 | adc_raw | 5 | 0 | 2 | uint16 | LE | ESP32 ADC 原始值（GPIO1） |
-| BATTERY_ADC | 0x50 | voltage_mv | 7 | 2 | 2 | uint16 | LE | 电池电压（mV） |
-| BATTERY_ADC | 0x50 | soc_percent | 9 | 4 | 1 | uint8 | — | 0~100%；未校准=`0xFF` |
-| BATTERY_ADC | 0x50 | foot | 10 | — | 2 | — | — | `5A A5` |
-
-**帧长** = 13 B | **PAYLOAD** = 5 B | **频率** = 0.2 Hz（每 5 s）
-
-> **ADC 驱动待实现。** 管脚：`BOARD_BAT_ADC_GPIO`（GPIO1）。
 
 ---
 
@@ -207,8 +189,7 @@
 | 1 | BLE_CONNECTED | BLE 已连接 | 未连接 |
 | 2 | ADS129X_READY | ADS129x 就绪 | 未就绪 |
 | 3 | IMU_READY | IMU 就绪（预留） | 未就绪 |
-| 4 | BATTERY_LOW | 电池低 | 正常 |
-| 5~7 | — | 保留 | — |
+| 4~7 | — | 保留 | — |
 
 ---
 
@@ -216,15 +197,14 @@
 
 | TYPE | 方向 | 名称 | PAYLOAD | 帧长 | 频率 |
 |------|------|------|---------|------|------|
-| `0x01` | 设备→上位机 | ACK | 2 | 10 | 按需 |
-| `0x02` | 设备→上位机 | NACK | 2 | 10 | 按需 |
-| `0x10` | 上位机→设备 | START_ACQ | 2 | 10 | 按需 |
-| `0x11` | 上位机→设备 | STOP_ACQ | 1 | 9 | 按需 |
-| `0x12` | 上位机→设备 | REQ_STATUS | 0 | 8 | 按需 |
-| `0x20` | 设备→上位机 | ECG_DATA | 58 | 66 | 20 Hz |
-| `0x30` | 设备→上位机 | DEVICE_STATUS | 12 | 20 | 1 Hz |
-| `0x40` | 设备→上位机 | IMU_DATA | 20 | 28 | 50 Hz（预留） |
-| `0x50` | 设备→上位机 | BATTERY_ADC | 5 | 13 | 0.2 Hz |
+| `0x01` | 设备→上位机 | ACK | 2 | 9 | 按需 |
+| `0x02` | 设备→上位机 | NACK | 2 | 9 | 按需 |
+| `0x10` | 上位机→设备 | START_ACQ | 2 | 9 | 按需 |
+| `0x11` | 上位机→设备 | STOP_ACQ | 1 | 8 | 按需 |
+| `0x12` | 上位机→设备 | REQ_STATUS | 0 | 7 | 按需 |
+| `0x20` | 设备→上位机 | ECG_DATA | 58 | 65 | 10 Hz |
+| `0x30` | 设备→上位机 | DEVICE_STATUS | 12 | 19 | 1 Hz |
+| `0x40` | 设备→上位机 | IMU_DATA | 20 | 27 | 50 Hz（预留） |
 | `0x7F` | 双向 | 保留 | — | — | — |
 
 ---
@@ -243,11 +223,10 @@
 
 | 包 | 帧长 | × 频率 | 带宽 |
 |----|------|--------|------|
-| ECG_DATA | 66 B | 20/s | 1320 B/s |
-| DEVICE_STATUS | 20 B | 1/s | 20 B/s |
-| BATTERY_ADC | 13 B | 0.2/s | 2.6 B/s |
-| IMU_DATA | 28 B | 50/s | 1400 B/s |
-| **合计（全启用）** | — | — | **≈ 2.75 KB/s** |
+| ECG_DATA | 65 B | 10/s | 650 B/s |
+| DEVICE_STATUS | 19 B | 1/s | 19 B/s |
+| IMU_DATA | 27 B | 50/s | 1350 B/s |
+| **合计（含预留IMU）** | — | — | **≈ 2.0 KB/s** |
 
 BLE 可用带宽（保守）：**8~18 KB/s** → 余量充足。
 
@@ -266,4 +245,3 @@ BLE 可用带宽（保守）：**8~18 KB/s** → 余量充足。
 | ECG 包详解 | [packets/ecg_data.md](packets/ecg_data.md) |
 | 状态包详解 | [packets/device_status.md](packets/device_status.md) |
 | IMU 包详解 | [packets/imu_data.md](packets/imu_data.md) |
-| 电池包详解 | [packets/battery_adc.md](packets/battery_adc.md) |

@@ -23,7 +23,7 @@
 5+LEN  FOOT_H     1     0x5A
 6+LEN  FOOT_L     1     0xA5
 ────────────────────────────────────────────
-总长度 = 8 + LEN 字节
+总长度 = 7 + LEN 字节
 ```
 
 ### 2.1 字段说明
@@ -40,9 +40,9 @@
 
 | 情况 | 长度 |
 |------|------|
-| 最小（空 PAYLOAD） | 8 B |
-| 最大（LEN=504） | 512 B |
-| 当前最大业务帧（ECG_DATA） | 66 B |
+| 最小（空 PAYLOAD） | 7 B |
+| 最大（LEN=504） | 511 B |
+| 当前最大业务帧（ECG_DATA） | 65 B |
 
 ## 3. TYPE 分配表
 
@@ -56,7 +56,6 @@
 | `0x20` | 设备 → 上位机 | ECG_DATA | 58 |
 | `0x30` | 设备 → 上位机 | DEVICE_STATUS | 12 |
 | `0x40` | 设备 → 上位机 | IMU_DATA | 20 |
-| `0x50` | 设备 → 上位机 | BATTERY_ADC | 5 |
 | `0x7F` | 双向 | 保留 | — |
 
 ## 4. 字节序
@@ -75,7 +74,7 @@
 1. 在字节流中搜索 SYNC (A5 5A)
 2. 读取 TYPE (offset 2)
 3. 读取 LEN (offset 3-4, LE)
-4. 校验 LEN ≤ 504（8+LEN ≤ 512）
+4. 校验 LEN ≤ 504（7+LEN ≤ 511）
 5. 读取 PAYLOAD (offset 5, 长度 LEN)
 6. 校验 FOOT (offset 5+LEN) == 5A A5
 7. 按 TYPE 解析 PAYLOAD

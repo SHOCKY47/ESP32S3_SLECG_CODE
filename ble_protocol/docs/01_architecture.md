@@ -49,9 +49,8 @@ flowchart TB
 | `AcquisitionFSM` | 采集状态机 | 待实现 |
 | `ECG_AcqTask` | DRDY 触发读帧、组包、Notify | 待实现 |
 | `StatusTask` | 周期性上报 DEVICE_STATUS | 待实现 |
-| `BatteryTask` | 周期性读取 ADC、上报 BATTERY_ADC | 待实现（GPIO1 已定义） |
 | `IMU_Task` | LSM6DS3TR 读取、上报 IMU_DATA | 预留，未实现 |
-| `ads129x` | ADS1291 SPI 驱动、500 Hz RDATAC | 已实现 |
+| `ads129x` | ADS1291 SPI 驱动、250 Hz RDATAC | 已实现 |
 
 ## 3. 采集状态机
 
@@ -70,9 +69,9 @@ stateDiagram-v2
 
 | 状态 | 行为 |
 |------|------|
-| **IDLE** | ADS129x 未处于 RDATAC；不上报 ECG_DATA；STATUS/BATTERY 正常上报 |
+| **IDLE** | ADS129x 未处于 RDATAC；不上报 ECG_DATA；BLE状态包正常上报 |
 | **STARTING** | 调用 `ads129x_init_start()` 或 `ads129x_start()`；成功则 ACK 并进入 RUNNING |
-| **RUNNING** | DRDY 500 Hz 读帧；每 25 样本封 ECG_DATA 包 Notify |
+| **RUNNING** | DRDY 250 Hz 读帧；每 25 样本封 ECG_DATA 包 Notify |
 | **STOPPING** | 调用 `ads129x_stop()`；ACK 后回到 IDLE |
 
 ## 4. 建议任务划分
@@ -80,7 +79,7 @@ stateDiagram-v2
 ### 4.1 ECG_AcqTask（高优先级）
 
 - **触发方式**：DRDY GPIO 下降沿中断 + 信号量，或高优先级轮询 `ads129x_is_data_ready()`
-- **频率**：500 Hz
+- **频率**：250 Hz
 - **流程**：
   1. 等待 DRDY
   2. `ads129x_read_frame(&sample)`
@@ -101,13 +100,7 @@ stateDiagram-v2
 - 组装 DEVICE_STATUS 帧并 Notify
 - 收到 REQ_STATUS 时立即额外发送一包
 
-### 4.4 BatteryTask（低优先级）
-
-- 周期：**每 5 s**（0.2 Hz）
-- 读取 `BOARD_BAT_ADC_GPIO`（GPIO1）ADC 值
-- 组装 BATTERY_ADC 帧并 Notify
-
-### 4.5 IMU_Task（预留）
+### 4.4 IMU_Task（预留）
 
 - 周期：**50 Hz**（LSM6DS3TR 启用后）
 - 当前阶段不创建此任务，协议格式已定义
@@ -115,7 +108,7 @@ stateDiagram-v2
 ## 5. 数据流（ECG 采集运行时）
 
 ```
-ADS1291 DRDY (500 Hz)
+ADS1291 DRDY (250 Hz)
     ↓
 ads129x_read_frame()
     ↓
@@ -123,7 +116,7 @@ ads129x_sample_t.ch1_value (int16)
     ↓
 环形缓冲 [25 samples]
     ↓
-封装 ECG_DATA 帧 (71 B)
+封装 ECG_DATA 帧 (65 B)
     ↓
 ble_slecg_send_notify() → 0xFFE2
     ↓
@@ -145,7 +138,7 @@ ble_slecg_send_notify() → 0xFFE2
 1. **GATT 映射不变**：下行 Write → `0xFFE1`，上行 Notify → `0xFFE2`
 2. **一帧一次传输**：不在 GATT 层做分包/粘包；应用层帧必须 ≤ 512 B
 3. **无 CRC**：完整性依赖 BLE 链路层 CRC 与帧头帧尾校验
-4. **IMU / 电池**：驱动未就绪前固件静默跳过，不影响 ECG 主流
+4. **IMU预留**：驱动未就绪前固件不发送，不影响ECG主流
 
 ## 8. 相关文件
 

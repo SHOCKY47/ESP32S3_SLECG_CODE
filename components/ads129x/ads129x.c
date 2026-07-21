@@ -53,6 +53,11 @@ typedef struct {
 	float y2;
 } ads129x_notch_state_t;
 
+typedef struct {
+	float d1;
+	float d2;
+} ads129x_biquad_state_t;
+
 static spi_device_handle_t s_spi_dev;
 static bool s_spi_bus_initialized;
 static uint32_t s_spi_freq_hz;
@@ -73,6 +78,15 @@ static float s_notch_b1;
 static float s_notch_b2;
 static float s_notch_a1;
 static float s_notch_a2;
+static ads129x_biquad_state_t s_lowpass_ch1;
+#if ADS129X_HAS_CH2
+static ads129x_biquad_state_t s_lowpass_ch2;
+#endif
+static float s_lowpass_b0;
+static float s_lowpass_b1;
+static float s_lowpass_b2;
+static float s_lowpass_a1;
+static float s_lowpass_a2;
 
 static void ads129x_delay_ms(uint32_t ms)
 {
@@ -220,6 +234,8 @@ static void ads129x_highpass_reset(uint32_t sample_rate_hz);
 static int32_t ads129x_highpass_step(ads129x_hp_state_t *state, int32_t input);
 static void ads129x_notch_reset(uint32_t sample_rate_hz);
 static int32_t ads129x_notch_step(ads129x_notch_state_t *state, int32_t input);
+static void ads129x_lowpass_reset(uint32_t sample_rate_hz);
+static int32_t ads129x_lowpass_step(ads129x_biquad_state_t *state, int32_t input);
 
 static int32_t ads129x_raw24_to_int32(const uint8_t raw[ADS129X_CHANNEL_SIZE]);
 static void ads129x_int32_to_24bit_bytes(int32_t value, uint8_t out[ADS129X_CHANNEL_SIZE]);
@@ -353,13 +369,15 @@ int ads129x_init(void)
 	}
 	ads129x_highpass_reset(ads129x_sample_rate_from_config1(ADS129X_CONFIG1_DEFAULT));
 	ads129x_notch_reset(ads129x_sample_rate_from_config1(ADS129X_CONFIG1_DEFAULT));
+	ads129x_lowpass_reset(ads129x_sample_rate_from_config1(ADS129X_CONFIG1_DEFAULT));
 
 	ESP_LOGI(TAG,
-		 "AFE: rate=%u Hz gain_CH1SET=0x%02X HP=%d(%.2fHz) Notch=%d(%.0fHz) RLD_SENS=0x%02X",
+		 "AFE: rate=%u Hz gain_CH1SET=0x%02X HP=%d(%.2fHz) Notch=%d(%.0fHz) LP=%d(%.0fHz) RLD_SENS=0x%02X",
 		 (unsigned)ADS129X_SAMPLE_RATE_HZ,
 		 ADS129X_CH1SET_DEFAULT,
 		 ADS129X_HIGHPASS_ENABLE, (double)ADS129X_HIGHPASS_CUTOFF_HZ,
 		 ADS129X_NOTCH_ENABLE, (double)ADS129X_NOTCH_FREQ_HZ,
+		 ADS129X_LOWPASS_ENABLE, (double)ADS129X_LOWPASS_CUTOFF_HZ,
 		 ADS129X_RLD_SENS_DEFAULT);
 
 	ESP_LOGI(TAG, "ADS129x ID/config verified: ID=0x%02X", regs[0]);
@@ -438,7 +456,11 @@ int ads129x_read_frame(ads129x_sample_t *sample)
 	if (ADS129X_NOTCH_ENABLE != 0) {
 		ch1_raw32 = ads129x_notch_step(&s_notch_ch1, ch1_raw32);
 	}
-	if ((ADS129X_HIGHPASS_ENABLE != 0) || (ADS129X_NOTCH_ENABLE != 0)) {
+	if (ADS129X_LOWPASS_ENABLE != 0) {
+		ch1_raw32 = ads129x_lowpass_step(&s_lowpass_ch1, ch1_raw32);
+	}
+	if ((ADS129X_HIGHPASS_ENABLE != 0) || (ADS129X_NOTCH_ENABLE != 0) ||
+	    (ADS129X_LOWPASS_ENABLE != 0)) {
 		ads129x_int32_to_24bit_bytes(ch1_raw32, sample->raw_ch1);
 	}
 	sample->ch1_value = ads129x_int32_to_int16(ch1_raw32 >> ADS129X_RAW_OUTPUT_SHIFT);
@@ -450,7 +472,11 @@ int ads129x_read_frame(ads129x_sample_t *sample)
 	if (ADS129X_NOTCH_ENABLE != 0) {
 		ch2_raw32 = ads129x_notch_step(&s_notch_ch2, ch2_raw32);
 	}
-	if ((ADS129X_HIGHPASS_ENABLE != 0) || (ADS129X_NOTCH_ENABLE != 0)) {
+	if (ADS129X_LOWPASS_ENABLE != 0) {
+		ch2_raw32 = ads129x_lowpass_step(&s_lowpass_ch2, ch2_raw32);
+	}
+	if ((ADS129X_HIGHPASS_ENABLE != 0) || (ADS129X_NOTCH_ENABLE != 0) ||
+	    (ADS129X_LOWPASS_ENABLE != 0)) {
 		ads129x_int32_to_24bit_bytes(ch2_raw32, sample->raw_ch2);
 	}
 	sample->ch2_value = ads129x_int32_to_int16(ch2_raw32 >> ADS129X_RAW_OUTPUT_SHIFT);
@@ -736,6 +762,7 @@ int ads129x_set_sampling_rate(uint8_t rate)
 	}
 	ads129x_highpass_reset(ads129x_sample_rate_from_config1(rate));
 	ads129x_notch_reset(ads129x_sample_rate_from_config1(rate));
+	ads129x_lowpass_reset(ads129x_sample_rate_from_config1(rate));
 
 	ret = ads129x_send_command(ADS129X_CMD_RDATAC);
 	if (ret < 0) {
@@ -967,6 +994,65 @@ static int32_t ads129x_notch_step(ads129x_notch_state_t *state, int32_t input)
 	state->x1 = x;
 	state->y2 = state->y1;
 	state->y1 = y;
+
+	if (y > 8388607.0f) {
+		return 8388607;
+	}
+	if (y < -8388608.0f) {
+		return -8388608;
+	}
+	return (int32_t)lroundf(y);
+}
+
+/*
+ * 二阶 Butterworth 低通（Q=1/sqrt(2)）。系数使用双线性变换后的
+ * 标准 biquad 公式，归一化为 a0=1；DF2T 每通道只需两个状态量。
+ */
+static void ads129x_lowpass_reset(uint32_t sample_rate_hz)
+{
+	const float butterworth_q = 0.7071067812f;
+	float fs;
+	float w0;
+	float c;
+	float alpha;
+	float a0;
+
+	if (sample_rate_hz == 0U) {
+		sample_rate_hz = ADS129X_SAMPLE_RATE_HZ;
+	}
+	fs = (float)sample_rate_hz;
+	if ((ADS129X_LOWPASS_CUTOFF_HZ <= 0.0f) ||
+	    (ADS129X_LOWPASS_CUTOFF_HZ >= (fs * 0.5f))) {
+		ESP_LOGE(TAG, "Lowpass %.1f Hz 超出有效范围 (0, %.1f)",
+			 (double)ADS129X_LOWPASS_CUTOFF_HZ, (double)(fs * 0.5f));
+		return;
+	}
+
+	w0 = 2.0f * (float)M_PI * (ADS129X_LOWPASS_CUTOFF_HZ / fs);
+	c = cosf(w0);
+	alpha = sinf(w0) / (2.0f * butterworth_q);
+	a0 = 1.0f + alpha;
+	s_lowpass_b0 = ((1.0f - c) * 0.5f) / a0;
+	s_lowpass_b1 = (1.0f - c) / a0;
+	s_lowpass_b2 = s_lowpass_b0;
+	s_lowpass_a1 = (-2.0f * c) / a0;
+	s_lowpass_a2 = (1.0f - alpha) / a0;
+
+	memset(&s_lowpass_ch1, 0, sizeof(s_lowpass_ch1));
+#if ADS129X_HAS_CH2
+	memset(&s_lowpass_ch2, 0, sizeof(s_lowpass_ch2));
+#endif
+	ESP_LOGI(TAG, "Lowpass Butterworth-2 @ %.1f Hz (fs=%u)",
+		 (double)ADS129X_LOWPASS_CUTOFF_HZ, (unsigned)sample_rate_hz);
+}
+
+static int32_t ads129x_lowpass_step(ads129x_biquad_state_t *state, int32_t input)
+{
+	float x = (float)input;
+	float y = (s_lowpass_b0 * x) + state->d1;
+
+	state->d1 = (s_lowpass_b1 * x) - (s_lowpass_a1 * y) + state->d2;
+	state->d2 = (s_lowpass_b2 * x) - (s_lowpass_a2 * y);
 
 	if (y > 8388607.0f) {
 		return 8388607;

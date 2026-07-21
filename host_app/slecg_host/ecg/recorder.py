@@ -8,6 +8,8 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
+
 from slecg_host.ecg.converter import EcgConverter
 from slecg_host.protocol.constants import SLECG_SAMPLE_RATE_HZ
 from slecg_host.protocol.payloads import EcgPacket
@@ -37,7 +39,12 @@ class EcgRecorder:
         if self._active:
             raise RuntimeError("Already recording")
         self._output_dir.mkdir(parents=True, exist_ok=True)
-        path = self._output_dir / f"ecg_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        stem = datetime.now().strftime("%Y%m%d_%H%M")
+        path = self._output_dir / f"{stem}.csv"
+        suffix = 1
+        while path.exists():
+            path = self._output_dir / f"{stem}_{suffix:02d}.csv"
+            suffix += 1
         self._file = open(path, "w", newline="", encoding="utf-8")
         self._writer = csv.writer(self._file)
         self._writer.writerow(
@@ -78,3 +85,23 @@ class EcgRecorder:
             if self._writer:
                 self._writer.writerow(item)
             self._queue.task_done()
+
+
+def load_recording(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
+    """Load recorder CSV and return session-relative seconds plus raw int16."""
+    timestamps: list[float] = []
+    raw_values: list[int] = []
+    with open(path, newline="", encoding="utf-8") as file:
+        reader = csv.DictReader(file)
+        required = {"timestamp_ms", "raw_int16"}
+        if not required.issubset(reader.fieldnames or []):
+            raise ValueError("不是有效的 SLECG testdata CSV")
+        for row in reader:
+            timestamps.append(float(row["timestamp_ms"]))
+            raw_values.append(int(row["raw_int16"]))
+    if not timestamps:
+        raise ValueError("记录文件中没有采样数据")
+    first = timestamps[0]
+    times = (np.asarray(timestamps, dtype=np.float64) - first) / 1000.0
+    raw = np.asarray(raw_values, dtype=np.int16)
+    return times, raw

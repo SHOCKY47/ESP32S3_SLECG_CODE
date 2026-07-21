@@ -166,7 +166,7 @@ sequenceDiagram
 
     Host->>Dev: START_ACQ (0x10)
     Dev-->>Host: ACK (0x01, orig=0x10)
-    loop 20 包/s
+    loop 10 包/s
         Dev-->>Host: ECG_DATA (0x20)
     end
 
