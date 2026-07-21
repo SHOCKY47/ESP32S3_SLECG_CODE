@@ -17,7 +17,7 @@ def test_ecg_buffer_seq_gap():
 
 
 def test_mv_converter():
-    conv = EcgConverter(vref=2.42, gain=6)
+    conv = EcgConverter(vref=4.033, gain=1)
     mv = conv.to_mv(32767)
     assert mv > 0
     assert conv.axis_label(DisplayMode.MV) == "Amplitude (mV)"

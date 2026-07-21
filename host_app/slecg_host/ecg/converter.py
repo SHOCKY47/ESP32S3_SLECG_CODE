@@ -1,4 +1,4 @@
-"""int16 to mV conversion — ADS1291 gain=6, Vref=2.42V, shift=8."""
+"""int16 to mV conversion — ADS1291 gain=1, Vref=4.033V, shift=4."""
 
 from __future__ import annotations
 
@@ -11,10 +11,10 @@ class DisplayMode(Enum):
 
 
 class EcgConverter:
-    def __init__(self, vref: float = 2.42, gain: int = 6) -> None:
+    def __init__(self, vref: float = 4.033, gain: int = 1) -> None:
         self.vref = vref
         self.gain = gain
-        # shift=8 时 int16 近似覆盖 24-bit 满幅：mV = raw * Vref*1000 / (gain * 2^15)
+        # shift=4 时 int16 近似覆盖 24-bit 满幅：mV = raw * Vref*1000 / (gain * 2^15)
         self._scale = (vref * 1000.0) / (gain * 32768.0)
 
     def to_mv(self, raw: int) -> float:

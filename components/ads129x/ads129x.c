@@ -11,12 +11,10 @@
 
 #include "driver/gpio.h"
 #include "esp_log.h"
-#include "esp_rom_gpio.h"
 #include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "soc/gpio_sig_map.h"
 
 static const char *TAG = "ads129x";
 
@@ -28,14 +26,12 @@ static const char *TAG = "ads129x";
 
 #define ADS129X_REGISTER_COUNT      12
 
-#define ADS129X_POWER_SETTLE_MS           200
+#define ADS129X_POWER_SETTLE_MS           10
 #define ADS129X_RESET_PULSE_MS            20
-#define ADS129X_RESET_SETTLE_MS           50
-#define ADS129X_REFBUF_SETTLE_MS          150
+#define ADS129X_RESET_SETTLE_MS           10
+#define ADS129X_REFBUF_SETTLE_MS          100
 #define ADS129X_START_INIT_SETTLE_MS      10
 #define ADS129X_RESET_COMMAND_SETTLE_MS   100
-#define ADS129X_INIT_ID_RETRY             3
-
 #define ADS129X_START_GUARD_US            1000
 #define ADS129X_RDATAC_GUARD_US           10
 #define ADS129X_COMMAND_PRE_GUARD_US      100
@@ -55,10 +51,6 @@ typedef struct {
 	float y1;
 	float y2;
 } ads129x_notch_state_t;
-
-typedef struct {
-	float prev_out;
-} ads129x_lp_state_t;
 
 static spi_device_handle_t s_spi_dev;
 static bool s_spi_bus_initialized;
@@ -80,12 +72,6 @@ static float s_notch_b2;
 static float s_notch_a1;
 static float s_notch_a2;
 
-static ads129x_lp_state_t s_lp_ch1;
-#if ADS129X_HAS_CH2
-static ads129x_lp_state_t s_lp_ch2;
-#endif
-static float s_lp_alpha;
-
 static void ads129x_delay_ms(uint32_t ms)
 {
 	vTaskDelay(pdMS_TO_TICKS(ms));
@@ -96,64 +82,24 @@ static void ads129x_delay_us(uint32_t us)
 	esp_rom_delay_us(us);
 }
 
-static void ads129x_force_gpio_out(gpio_num_t pin, int level)
-{
-	gpio_hold_dis(pin);
-	esp_rom_gpio_connect_out_signal((uint32_t)pin, SIG_GPIO_OUT_IDX, false, false);
-	(void)gpio_set_direction(pin, GPIO_MODE_OUTPUT);
-	(void)gpio_pulldown_dis(pin);
-	(void)gpio_pullup_dis(pin);
-	gpio_sleep_sel_dis(pin);
-	gpio_set_level(pin, level);
-}
-
 static void ads129x_pwdn_set_active(void)
 {
-	ads129x_force_gpio_out(BOARD_ADS_PWDN_GPIO, 0);
+	gpio_set_level(BOARD_ADS_PWDN_GPIO, 0);
 }
 
 static void ads129x_pwdn_set_inactive(void)
 {
-	ads129x_force_gpio_out(BOARD_ADS_PWDN_GPIO, 1);
+	gpio_set_level(BOARD_ADS_PWDN_GPIO, 1);
 }
 
 static void ads129x_start_set_inactive(void)
 {
-	ads129x_force_gpio_out(BOARD_ADS_START_GPIO, 0);
-}
-
-/* 防止 light-sleep / modem-sleep 自动改写 ADS 控制脚（否则 PWDN 会被拉低导致读数全 0） */
-static void ads129x_disable_gpio_sleep_switch(void)
-{
-	const gpio_num_t pins[] = {
-		BOARD_ADS_DRDY_GPIO,
-		BOARD_ADS_MISO_GPIO,
-		BOARD_ADS_SCLK_GPIO,
-		BOARD_ADS_MOSI_GPIO,
-		BOARD_ADS_CS_GPIO,
-		BOARD_ADS_START_GPIO,
-		BOARD_ADS_PWDN_GPIO,
-	};
-
-	for (size_t i = 0; i < ADS129X_ARRAY_SIZE(pins); ++i) {
-		gpio_sleep_sel_dis(pins[i]);
-	}
-}
-
-static void ads129x_reclaim_ctrl_pins(void)
-{
-	ads129x_force_gpio_out(BOARD_ADS_START_GPIO, 0);
-	ads129x_force_gpio_out(BOARD_ADS_PWDN_GPIO, 1); /* /PWDN 高 = 运行 */
+	gpio_set_level(BOARD_ADS_START_GPIO, 0);
 }
 
 static int ads129x_spi_set_frequency(uint32_t freq_hz)
 {
 	esp_err_t err;
-
-	/* REG/DATA 同频时禁止 remove/add，否则易把控制脚搅乱 */
-	if ((s_spi_dev != NULL) && (s_spi_freq_hz == freq_hz)) {
-		return 0;
-	}
 
 	if (s_spi_dev != NULL) {
 		err = spi_bus_remove_device(s_spi_dev);
@@ -165,11 +111,9 @@ static int ads129x_spi_set_frequency(uint32_t freq_hz)
 
 	spi_device_interface_config_t devcfg = {
 		.clock_speed_hz = freq_hz,
-		.mode = 1, /* CPOL=0, CPHA=1，ADS129x 要求 */
+		.mode = 1,
 		.spics_io_num = BOARD_ADS_CS_GPIO,
 		.queue_size = 1,
-		.cs_ena_pretrans = 4,
-		.cs_ena_posttrans = 4,
 	};
 
 	err = spi_bus_add_device(ADS129X_SPI_HOST, &devcfg, &s_spi_dev);
@@ -178,29 +122,22 @@ static int ads129x_spi_set_frequency(uint32_t freq_hz)
 	}
 
 	s_spi_freq_hz = freq_hz;
-	ads129x_reclaim_ctrl_pins();
 	return 0;
 }
 
 static int ads129x_spi_transceive(const uint8_t *tx_buf, uint8_t *rx_buf, size_t len)
 {
-	uint8_t discard[32];
 	spi_transaction_t trans = { 0 };
 
 	if (s_spi_dev == NULL) {
 		return -ENODEV;
 	}
-	if ((len == 0U) || (len > sizeof(discard))) {
-		return -EINVAL;
-	}
 
 	trans.length = len * 8U;
-	trans.rxlength = len * 8U;
 	trans.tx_buffer = tx_buf;
-	/* 短传输 + DMA 时 NULL rx 容易读到全 0；始终提供 RX 缓冲并用 polling */
-	trans.rx_buffer = (rx_buf != NULL) ? rx_buf : discard;
+	trans.rx_buffer = rx_buf;
 
-	if (spi_device_polling_transmit(s_spi_dev, &trans) != ESP_OK) {
+	if (spi_device_transmit(s_spi_dev, &trans) != ESP_OK) {
 		return -EIO;
 	}
 
@@ -219,13 +156,6 @@ static void ads129x_highpass_reset(uint32_t sample_rate_hz);
 static int32_t ads129x_highpass_step(ads129x_hp_state_t *state, int32_t input);
 static void ads129x_notch_reset(uint32_t sample_rate_hz);
 static int32_t ads129x_notch_step(ads129x_notch_state_t *state, int32_t input);
-static void ads129x_lowpass_reset(uint32_t sample_rate_hz);
-static int32_t ads129x_lowpass_step(ads129x_lp_state_t *state, int32_t input);
-static int32_t ads129x_clamp24(int32_t v);
-static int32_t ads129x_apply_filters(int32_t raw32,
-				     ads129x_hp_state_t *hp,
-				     ads129x_notch_state_t *notch,
-				     ads129x_lp_state_t *lp);
 
 static int32_t ads129x_raw24_to_int32(const uint8_t raw[ADS129X_CHANNEL_SIZE]);
 static void ads129x_int32_to_24bit_bytes(int32_t value, uint8_t out[ADS129X_CHANNEL_SIZE]);
@@ -247,7 +177,30 @@ int ads129x_init(void)
 	ESP_LOGI(TAG, "ADS129x: ADS1292 (2ch)");
 #endif
 
-	/* 先固定控制脚，避免 SPI 初始化期间 PWDN/START 浮空 */
+	if (!s_spi_bus_initialized) {
+		spi_bus_config_t buscfg = {
+			.mosi_io_num = BOARD_ADS_MOSI_GPIO,
+			.miso_io_num = BOARD_ADS_MISO_GPIO,
+			.sclk_io_num = BOARD_ADS_SCLK_GPIO,
+			.quadwp_io_num = -1,
+			.quadhd_io_num = -1,
+			.max_transfer_sz = 32,
+		};
+
+		err = spi_bus_initialize(ADS129X_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO);
+		if (err != ESP_OK) {
+			ESP_LOGE(TAG, "SPI bus init failed: %s", esp_err_to_name(err));
+			return -EIO;
+		}
+		s_spi_bus_initialized = true;
+	}
+
+	ret = ads129x_spi_set_frequency(ADS129X_SPI_FREQ_REG);
+	if (ret < 0) {
+		ESP_LOGE(TAG, "SPI device init failed at reg speed");
+		return ret;
+	}
+
 	gpio_config_t gpio_out = {
 		.pin_bit_mask = (1ULL << BOARD_ADS_START_GPIO) | (1ULL << BOARD_ADS_PWDN_GPIO),
 		.mode = GPIO_MODE_OUTPUT,
@@ -275,140 +228,50 @@ int ads129x_init(void)
 	}
 
 	ads129x_start_set_inactive();
-	ads129x_pwdn_set_active(); /* 先保持复位，再起 SPI */
-	ads129x_disable_gpio_sleep_switch();
+	ads129x_pwdn_set_inactive();
 
-	if (!s_spi_bus_initialized) {
-		spi_bus_config_t buscfg = {
-			.mosi_io_num = BOARD_ADS_MOSI_GPIO,
-			.miso_io_num = BOARD_ADS_MISO_GPIO,
-			.sclk_io_num = BOARD_ADS_SCLK_GPIO,
-			.quadwp_io_num = -1,
-			.quadhd_io_num = -1,
-			.max_transfer_sz = 32,
-			.flags = SPICOMMON_BUSFLAG_MASTER | SPICOMMON_BUSFLAG_GPIO_PINS,
-		};
-
-		/* 短帧寄存器读写禁用 DMA，避免 MISO 读回全 0 */
-		err = spi_bus_initialize(ADS129X_SPI_HOST, &buscfg, SPI_DMA_DISABLED);
-		if (err != ESP_OK) {
-			ESP_LOGE(TAG, "SPI bus init failed: %s", esp_err_to_name(err));
-			return -EIO;
-		}
-		s_spi_bus_initialized = true;
-	}
-
-	ret = ads129x_spi_set_frequency(ADS129X_SPI_FREQ_REG);
-	if (ret < 0) {
-		ESP_LOGE(TAG, "SPI device init failed at reg speed");
-		return ret;
-	}
-
-	/* spi_set_frequency 会 reclaim 并把 PWDN 拉高；这里再做一次标准复位脉冲 */
+	ads129x_delay_ms(ADS129X_POWER_SETTLE_MS);
 	ads129x_pwdn_set_active();
 	ads129x_delay_ms(ADS129X_RESET_PULSE_MS);
 	ads129x_pwdn_set_inactive();
 	ads129x_delay_ms(ADS129X_RESET_SETTLE_MS);
-	(void)ads129x_send_command(ADS129X_CMD_RESET);
-	ads129x_delay_ms(ADS129X_RESET_COMMAND_SETTLE_MS);
 
-	for (int attempt = 1; attempt <= ADS129X_INIT_ID_RETRY; ++attempt) {
-		ret = ads129x_configure_default();
-		if (ret < 0) {
-			ESP_LOGE(TAG, "register configure failed (try %d): %d", attempt, ret);
-			return ret;
-		}
-
-		ret = ads129x_rreg(ADS129X_REG_ID, sizeof(regs), regs);
-		if (ret < 0) {
-			ESP_LOGW(TAG, "register dump failed (try %d): %d", attempt, ret);
-		} else {
-			ESP_LOGI(TAG,
-				 "寄存器读回(try %d): ID=0x%02X CONFIG1=0x%02X CONFIG2=0x%02X "
-				 "LOFF=0x%02X CH1SET=0x%02X CH2SET=0x%02X RLD=0x%02X LOFF_SENS=0x%02X",
-				 attempt,
-				 regs[0], regs[1], regs[2], regs[3],
-				 regs[4], regs[5], regs[6], regs[7]);
-			ESP_LOG_BUFFER_HEX_LEVEL(TAG, regs, sizeof(regs), ESP_LOG_INFO);
-
-			if ((regs[0] == ADS129X_ID_DEFAULT) &&
-			    (regs[4] == ADS129X_CH1SET_DEFAULT)) {
-				break;
-			}
-
-			ESP_LOGW(TAG,
-				 "ADS 配置未生效: ID=0x%02X(期望0x%02X) CH1SET=0x%02X(期望0x%02X)",
-				 regs[0], ADS129X_ID_DEFAULT,
-				 regs[4], ADS129X_CH1SET_DEFAULT);
-		}
-
-		if (attempt == ADS129X_INIT_ID_RETRY) {
-			/*
-			 * 历史现象：启动期 RREG 偶发全 0，但后续 RDATAC 仍可出数。
-			 * 不再硬失败阻断采集；写寄存器仍已执行，仅标记配置未验证。
-			 */
-			ESP_LOGW(TAG,
-				 "ADS1291 寄存器读回校验失败，继续启动（请检查 DOUT/GPIO46 与供电）");
-			break;
-		}
-
-		ads129x_pwdn_set_active();
-		ads129x_delay_ms(ADS129X_RESET_PULSE_MS);
-		ads129x_pwdn_set_inactive();
-		ads129x_delay_ms(ADS129X_RESET_SETTLE_MS);
-		(void)ads129x_send_command(ADS129X_CMD_RESET);
-		ads129x_delay_ms(ADS129X_RESET_COMMAND_SETTLE_MS);
+	ret = ads129x_configure_default();
+	if (ret < 0) {
+		ESP_LOGE(TAG, "register configure failed: %d", ret);
+		return ret;
 	}
-
 	ads129x_highpass_reset(ads129x_sample_rate_from_config1(ADS129X_CONFIG1_DEFAULT));
 	ads129x_notch_reset(ads129x_sample_rate_from_config1(ADS129X_CONFIG1_DEFAULT));
-	ads129x_lowpass_reset(ads129x_sample_rate_from_config1(ADS129X_CONFIG1_DEFAULT));
 
 	ESP_LOGI(TAG,
-		 "AFE: rate=%u Hz CH1SET=0x%02X(读回0x%02X) HP=%d(%.2fHz) Notch=%d(%.0fHz) "
-		 "LP=%d(%.0fHz) RLD=0x%02X LOFF_SENS=0x%02X shift=%u",
+		 "AFE: rate=%u Hz gain_CH1SET=0x%02X HP=%d(%.2fHz) Notch=%d(%.0fHz) RLD_SENS=0x%02X",
 		 (unsigned)ADS129X_SAMPLE_RATE_HZ,
-		 ADS129X_CH1SET_DEFAULT, regs[4],
+		 ADS129X_CH1SET_DEFAULT,
 		 ADS129X_HIGHPASS_ENABLE, (double)ADS129X_HIGHPASS_CUTOFF_HZ,
 		 ADS129X_NOTCH_ENABLE, (double)ADS129X_NOTCH_FREQ_HZ,
-		 ADS129X_LOWPASS_ENABLE, (double)ADS129X_LOWPASS_CUTOFF_HZ,
-		 ADS129X_RLD_SENS_DEFAULT,
-		 ADS129X_LOFF_SENS_DEFAULT,
-		 (unsigned)ADS129X_RAW_OUTPUT_SHIFT);
+		 ADS129X_RLD_SENS_DEFAULT);
+
+	ret = ads129x_rreg(ADS129X_REG_ID, sizeof(regs), regs);
+	if (ret == 0) {
+		ESP_LOGI(TAG, "ADS129x ID: 0x%02x", regs[0]);
+		if (regs[0] != ADS129X_ID_DEFAULT) {
+			ESP_LOGW(TAG, "ADS129x ID differs from compile-time default: expected 0x%02x",
+				 ADS129X_ID_DEFAULT);
+		}
+		ESP_LOG_BUFFER_HEX_LEVEL(TAG, regs, sizeof(regs), ESP_LOG_INFO);
+	} else {
+		ESP_LOGW(TAG, "register dump failed: %d", ret);
+	}
 
 	ret = ads129x_spi_set_frequency(ADS129X_SPI_FREQ_DATA);
 	if (ret < 0) {
 		ESP_LOGE(TAG, "SPI switch to data speed failed");
 		return ret;
 	}
-	ads129x_reclaim_ctrl_pins();
-	ads129x_disable_gpio_sleep_switch();
-	ESP_LOGI(TAG, "ADS129x SPI host=%d freq=%u Hz, PWDN=%d START=%d",
-		 (int)ADS129X_SPI_HOST,
-		 (unsigned)s_spi_freq_hz,
-		 gpio_get_level(BOARD_ADS_PWDN_GPIO),
-		 gpio_get_level(BOARD_ADS_START_GPIO));
-	/*
-	 * 若寄存器已校验通过，不要因 get_level 仍为 0 而硬失败：
-	 * 本板存在读回与真实驱动不一致的情况；ID=0x52 已证明芯片可通信。
-	 */
-	if (gpio_get_level(BOARD_ADS_PWDN_GPIO) == 0) {
-		if (regs[0] == ADS129X_ID_DEFAULT) {
-			ESP_LOGW(TAG,
-				 "PWDN 读回为低，但 ID 校验已通过，继续启动（请用表笔确认 GPIO13）");
-		} else {
-			ESP_LOGE(TAG, "PWDN 仍为低且寄存器未校验通过");
-			return -EIO;
-		}
-	}
+	ESP_LOGI(TAG, "ADS129x SPI switched to %u Hz", (unsigned)ADS129X_SPI_FREQ_DATA);
 
 	return 0;
-}
-
-void ads129x_ensure_powered(void)
-{
-	ads129x_reclaim_ctrl_pins();
-	ads129x_disable_gpio_sleep_switch();
 }
 
 int ads129x_stop(void)
@@ -456,17 +319,25 @@ int ads129x_read_frame(ads129x_sample_t *sample)
 	sample->loff_status = ads129x_loff_from_status(sample->status);
 
 	ch1_raw32 = ads129x_raw24_to_int32(sample->raw_ch1);
-	ch1_raw32 = ads129x_apply_filters(ch1_raw32, &s_hp_ch1, &s_notch_ch1, &s_lp_ch1);
-	if ((ADS129X_HIGHPASS_ENABLE != 0) || (ADS129X_NOTCH_ENABLE != 0) ||
-	    (ADS129X_LOWPASS_ENABLE != 0)) {
+	if (ADS129X_HIGHPASS_ENABLE != 0) {
+		ch1_raw32 = ads129x_highpass_step(&s_hp_ch1, ch1_raw32);
+	}
+	if (ADS129X_NOTCH_ENABLE != 0) {
+		ch1_raw32 = ads129x_notch_step(&s_notch_ch1, ch1_raw32);
+	}
+	if ((ADS129X_HIGHPASS_ENABLE != 0) || (ADS129X_NOTCH_ENABLE != 0)) {
 		ads129x_int32_to_24bit_bytes(ch1_raw32, sample->raw_ch1);
 	}
 	sample->ch1_value = ads129x_int32_to_int16(ch1_raw32 >> ADS129X_RAW_OUTPUT_SHIFT);
 #if ADS129X_HAS_CH2
 	ch2_raw32 = ads129x_raw24_to_int32(sample->raw_ch2);
-	ch2_raw32 = ads129x_apply_filters(ch2_raw32, &s_hp_ch2, &s_notch_ch2, &s_lp_ch2);
-	if ((ADS129X_HIGHPASS_ENABLE != 0) || (ADS129X_NOTCH_ENABLE != 0) ||
-	    (ADS129X_LOWPASS_ENABLE != 0)) {
+	if (ADS129X_HIGHPASS_ENABLE != 0) {
+		ch2_raw32 = ads129x_highpass_step(&s_hp_ch2, ch2_raw32);
+	}
+	if (ADS129X_NOTCH_ENABLE != 0) {
+		ch2_raw32 = ads129x_notch_step(&s_notch_ch2, ch2_raw32);
+	}
+	if ((ADS129X_HIGHPASS_ENABLE != 0) || (ADS129X_NOTCH_ENABLE != 0)) {
 		ads129x_int32_to_24bit_bytes(ch2_raw32, sample->raw_ch2);
 	}
 	sample->ch2_value = ads129x_int32_to_int16(ch2_raw32 >> ADS129X_RAW_OUTPUT_SHIFT);
@@ -652,8 +523,6 @@ int ads129x_init_start(void)
 
 	ESP_LOGI(TAG, "init_start: 准备首次进入 RDATAC, spi=%lu Hz",
 		 (unsigned long)s_spi_freq_hz);
-	ads129x_pwdn_set_inactive();
-	ads129x_disable_gpio_sleep_switch();
 	ads129x_log_pins("init_start前");
 
 	if (s_spi_freq_hz != ADS129X_SPI_FREQ_DATA) {
@@ -693,8 +562,6 @@ int ads129x_start(void)
 
 	ESP_LOGI(TAG, "start: 再次进入 RDATAC, spi=%lu Hz",
 		 (unsigned long)s_spi_freq_hz);
-	ads129x_pwdn_set_inactive();
-	ads129x_disable_gpio_sleep_switch();
 	ads129x_log_pins("start前");
 
 	if (s_spi_freq_hz != ADS129X_SPI_FREQ_DATA) {
@@ -748,7 +615,6 @@ int ads129x_set_sampling_rate(uint8_t rate)
 	}
 	ads129x_highpass_reset(ads129x_sample_rate_from_config1(rate));
 	ads129x_notch_reset(ads129x_sample_rate_from_config1(rate));
-	ads129x_lowpass_reset(ads129x_sample_rate_from_config1(rate));
 
 	ret = ads129x_send_command(ADS129X_CMD_RDATAC);
 	if (ret < 0) {
@@ -988,80 +854,6 @@ static int32_t ads129x_notch_step(ads129x_notch_state_t *state, int32_t input)
 		return -8388608;
 	}
 	return (int32_t)lroundf(y);
-}
-
-static int32_t ads129x_clamp24(int32_t v)
-{
-	if (v > 8388607) {
-		return 8388607;
-	}
-	if (v < -8388608) {
-		return -8388608;
-	}
-	return v;
-}
-
-static int32_t ads129x_apply_filters(int32_t raw32,
-				     ads129x_hp_state_t *hp,
-				     ads129x_notch_state_t *notch,
-				     ads129x_lp_state_t *lp)
-{
-	if (ADS129X_HIGHPASS_ENABLE != 0) {
-		raw32 = ads129x_highpass_step(hp, raw32);
-	}
-	if (ADS129X_NOTCH_ENABLE != 0) {
-		raw32 = ads129x_notch_step(notch, raw32);
-	}
-	if (ADS129X_LOWPASS_ENABLE != 0) {
-		raw32 = ads129x_lowpass_step(lp, raw32);
-	}
-	return ads129x_clamp24(raw32);
-}
-
-static void ads129x_lowpass_reset(uint32_t sample_rate_hz)
-{
-	float fs;
-	float fc;
-	float x;
-
-	if (sample_rate_hz == 0U) {
-		sample_rate_hz = ADS129X_SAMPLE_RATE_HZ;
-	}
-	fs = (float)sample_rate_hz;
-	fc = ADS129X_LOWPASS_CUTOFF_HZ;
-	if (fc <= 0.0f) {
-		fc = 40.0f;
-	}
-	if (fc >= (fs * 0.45f)) {
-		fc = fs * 0.45f;
-		ESP_LOGW(TAG, "Lowpass 截断到 %.1f Hz (Nyquist 限制)", (double)fc);
-	}
-
-	/* alpha = 1 - exp(-2*pi*fc/fs) */
-	x = -2.0f * (float)M_PI * (fc / fs);
-	s_lp_alpha = 1.0f - expf(x);
-	if (s_lp_alpha < 0.01f) {
-		s_lp_alpha = 0.01f;
-	} else if (s_lp_alpha > 0.99f) {
-		s_lp_alpha = 0.99f;
-	}
-
-	s_lp_ch1.prev_out = 0.0f;
-#if ADS129X_HAS_CH2
-	s_lp_ch2.prev_out = 0.0f;
-#endif
-
-	ESP_LOGI(TAG, "Lowpass IIR @ %.1f Hz (fs=%u, alpha=%.4f)",
-		 (double)fc, (unsigned)sample_rate_hz, (double)s_lp_alpha);
-}
-
-static int32_t ads129x_lowpass_step(ads129x_lp_state_t *state, int32_t input)
-{
-	float xin = (float)input;
-	float y = state->prev_out + (s_lp_alpha * (xin - state->prev_out));
-
-	state->prev_out = y;
-	return ads129x_clamp24((int32_t)lroundf(y));
 }
 
 static int ads129x_wait_drdy_inactive(void)

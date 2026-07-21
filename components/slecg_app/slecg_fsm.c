@@ -123,17 +123,13 @@ static void do_start_acq(uint8_t orig_type, bool from_ble)
         slecg_uart_stream_flush();
     }
 
-    /* 先拉高 PWDN，再读寄存器；否则 BLE sleep 后采集前诊断/数据会全 0 */
-    ads129x_ensure_powered();
+    /* 开始前寄存器快照（仍在 SDATAC）；BLE 下可在 monitor 直接看到 */
     ESP_LOGI(TAG, "采集启动诊断: ads_ready=%d ever_started=%d from_ble=%d",
              (int)s_runtime->ads_ready,
              (int)s_runtime->ads_ever_started,
              (int)from_ble);
     ads129x_log_pins("采集前");
     (void)ads129x_log_registers("采集前");
-
-    /* 采集前强制退出掉电，避免 BLE sleep 把 PWDN 拉低后读数全 0 */
-    /* 具体拉高在 ads129x_init_start/start 内完成 */
 
     slecg_ecg_reset_stats();
     ret = ads_start_hw();

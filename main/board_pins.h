@@ -13,8 +13,8 @@
  *   SCLK → GPIO9
  *   DIN  → GPIO10 (MOSI)
  *   CS   → GPIO11
- *   START→ GPIO12  （注意：ESP32-S3 SPI2 默认 SCLK 也是 12，故 ADS SPI 必须用 SPI3）
- *   PWDN → GPIO13  （注意：ESP32-S3 SPI2 默认 MISO 也是 13）
+ *   START→ GPIO12
+ *   PWDN → GPIO13
  */
 
 /* 电池电压采集（本阶段不启用） */

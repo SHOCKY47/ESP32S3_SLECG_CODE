@@ -35,10 +35,11 @@
  * ESP-IDF 平台绑定。
  *
  * 板级 GPIO 定义见 board_pins.h（main/ 目录，由组件 CMakeLists 加入 include 路径）。
- * SPI 使用 SPI3_HOST（避开 SPI2 默认 IOMUX 与 START/PWDN 冲突），1MHz，Mode 1。
+ * SPI 使用 SPI2_HOST，寄存器阶段 500kHz，RDATAC 阶段 1MHz，Mode 1。
  */
-#define ADS129X_SPI_HOST             SPI3_HOST /* 避开 SPI2 默认脚 11/12/13=CS/START/PWDN */
-#define ADS129X_SPI_FREQ_REG         1000000U
+#define ADS129X_SPI_HOST             SPI2_HOST
+#define ADS129X_SPI_FREQ_REG         500000U
+/* 数据阶段原先 8MHz，在部分板上易导致无效/全0；先降到 1MHz 保证可靠 */
 #define ADS129X_SPI_FREQ_DATA        1000000U
 
 /*
@@ -1048,9 +1049,9 @@
  * 默认寄存器表：
  * - ID:        由 ADS129X_CHIP 映射。
  * - CONFIG1:   由 ADS129X_SAMPLE_RATE_HZ 决定。
- * - CONFIG2:   0xA0，内部参考缓冲开启，2.42V 参考（AVDD=3.3V）；关闭导联脱落比较器。
+ * - CONFIG2:   0xF0，内部参考缓冲开启，4.033V 参考，导联脱落比较器开启。
  * - LOFF:      0x54，直流导联脱落检测，电流 22nA，阈值 90%/10%。
- * - CH1SET:    CH1 正常输入，PGA gain = 6（3.3V/2.42V 参考下适合心电幅度）。
+ * - CH1SET:    0x10，CH1 正常输入，PGA gain = 1（饱和排查用最低增益）。
  * - CH2SET:    0x81，当 ADS129X_CHIP 为 ADS1291 时，power-down + input short。
  * - RLD_SENS:  0x33，开启 RLD 和 RLD 脱落检测，CH1P/CH1N 参与 RLD 共模计算。
  * - LOFF_SENS: 0x03，CH1P/CH1N 参与导联脱落检测。
@@ -1062,29 +1063,42 @@
 
 #define ADS129X_ID_DEFAULT                        ADS129X_ID_FROM_CHIP(ADS129X_CHIP)
 #define ADS129X_CONFIG1_DEFAULT                   ADS129X_CONFIG1_FROM_SAMPLE_RATE(ADS129X_SAMPLE_RATE_HZ)
-#define ADS129X_CONFIG2_DEFAULT                   ADS129X_CONFIG2_INTERNAL_REF_2V4
+#define ADS129X_CONFIG2_DEFAULT                   (ADS129X_CONFIG2_INTERNAL_REF_4V | ADS129X_CONFIG2_PDB_LOFF_COMP_ENABLED)
 #define ADS129X_LOFF_DEFAULT                      ADS129X_LOFF_DC(ADS129X_LOFF_COMP_TH_90_10, ADS129X_LOFF_CURRENT_22NA)
-#define ADS129X_CH1SET_DEFAULT                    ADS129X_CH1SET_NORMAL(ADS129X_CH1SET_GAIN_6)
+#define ADS129X_CH1SET_DEFAULT                    ADS129X_CH1SET_NORMAL(ADS129X_CH1SET_GAIN_1)
 #define ADS129X_CH2SET_DEFAULT                    ADS129X_CH2SET_POWERDOWN_SHORT
-#define ADS129X_RLD_SENS_DEFAULT                  ADS129X_RLD_SENS_CH1_RLD
-#define ADS129X_LOFF_SENS_DEFAULT                 ADS129X_LOFF_SENS_DISABLED
+#define ADS129X_RLD_SENS_DEFAULT                  (ADS129X_RLD_LOFF_SENS_ENABLED | ADS129X_RLD_SENS_CH1_RLD)
+#define ADS129X_LOFF_SENS_DEFAULT                 ADS129X_LOFF_SENS_CH1_PN
 #define ADS129X_LOFF_STAT_DEFAULT                 ADS129X_LOFF_STAT_ALL_CONNECTED
 #define ADS129X_RESP1_DEFAULT                     ADS129X_RESP1_NON_RESP
 #define ADS129X_RESP2_DEFAULT                     ADS129X_RESP2_RLDREF_INTERNAL
 #define ADS129X_GPIO_DEFAULT                      ADS129X_GPIO_DEFAULT_VALUE
 
 /*
- * 驱动内数字滤波（读帧后、压缩为 int16 前）：
- * 顺序：高通 → 50Hz 陷波 → 低通
+ * 驱动内一阶高通滤波开关。
+ *
+ * 置 1：驱动读帧后先对通道 24-bit ADC 码做一阶 IIR 高通，再生成 int16 输出，
+ *       并把 raw_ch* 回写成高通后的 24-bit 二进制补码字节。
+ * 置 0：驱动只做符号扩展、右移压缩和限幅，raw_ch* 保留芯片原始 24-bit 字节。
  */
 #ifndef ADS129X_HIGHPASS_ENABLE
 #define ADS129X_HIGHPASS_ENABLE                  1
 #endif
 
+/*
+ * 高通截止频率，单位 Hz。
+ *
+ * 精度和 QX_Driver/ads129x.c 保持一致：初始化或采样率变化时把 alpha 换算为 Q31，
+ * 每个采样点仍使用定点整数运算。
+ */
 #ifndef ADS129X_HIGHPASS_CUTOFF_HZ
-#define ADS129X_HIGHPASS_CUTOFF_HZ               0.4f
+#define ADS129X_HIGHPASS_CUTOFF_HZ               0.2f
 #endif
 
+/*
+ * 50 Hz 工频陷波（数字 IIR）。ADS1291 芯片无内置 notch，在驱动读帧路径中实现。
+ * 处理顺序：高通 → 陷波 → 右移压缩为 int16。
+ */
 #ifndef ADS129X_NOTCH_ENABLE
 #define ADS129X_NOTCH_ENABLE                     1
 #endif
@@ -1093,26 +1107,20 @@
 #define ADS129X_NOTCH_FREQ_HZ                    50.0f
 #endif
 
-/* 陷波极点半径 (0~1)，略放宽以更好抑制工频 */
+/* 陷波极点半径 (0~1)，越接近 1 越窄；0.95 兼顾抑制与波形失真 */
 #ifndef ADS129X_NOTCH_R
-#define ADS129X_NOTCH_R                          0.92f
-#endif
-
-#ifndef ADS129X_LOWPASS_ENABLE
-#define ADS129X_LOWPASS_ENABLE                   1
-#endif
-
-#ifndef ADS129X_LOWPASS_CUTOFF_HZ
-#define ADS129X_LOWPASS_CUTOFF_HZ                40.0f
+#define ADS129X_NOTCH_R                          0.95f
 #endif
 
 /*
  * 24-bit ADC 码输出压缩位数。
  *
- * 右移 8 位后约等于映射到 int16 满幅。
- * 滤波开启时：高通 → 陷波 → 低通 → 右移限幅。
+ * 驱动内部先把 24-bit two's complement 扩展到 int32_t；
+ * 24-bit 转 16 bit 默认右移位数为 8，根据需求可调整为 4。
+ * 若高通开启，则先做驱动内高通，再算术右移该位数并限幅到 int16_t。
+ * 若高通关闭，则直接算术右移该位数并限幅到 int16_t。
  */
-#define ADS129X_RAW_OUTPUT_SHIFT                  8
+#define ADS129X_RAW_OUTPUT_SHIFT                  4
 
 /*
  * 单帧采样数据。
@@ -1140,9 +1148,6 @@ typedef struct {
 
 /* 初始化 SPI/GPIO、复位 ADS129x、写默认寄存器并读回寄存器打印确认。 */
 int ads129x_init(void);
-
-/* 确保退出 /PWDN，并禁止 GPIO sleep 改写 ADS 控制脚。 */
-void ads129x_ensure_powered(void);
 
 /* 初始化后首次开始采集：切到高速 SPI，START 后等待 10ms，再进入 RDATAC。 */
 int ads129x_init_start(void);
