@@ -144,15 +144,32 @@ static void do_start_acq(uint8_t orig_type, bool from_ble)
         return;
     }
 
-    s_runtime->acq = SLECG_ACQ_RUNNING;
-    s_runtime->error_code = SLECG_ERR_NONE;
-
-    /* 先打日志，再按策略关/留日志 */
+    /*
+     * UART 模式的二进制边界：
+     * 1. 先完成 ADS 启动和所有文本诊断；
+     * 2. flush 后关闭全局 ESP_LOG；
+     * 3. 最后才将 acq 设为 RUNNING，释放 ECG 任务。
+     *
+     * 不能先设 RUNNING 再关日志，否则高优先级 ECG 任务
+     * 会与 FSM 尾部日志同时写 stdout，破坏首批二进制帧。
+     */
     ESP_LOGI(TAG, "采集已开始，传输=%s sample_rate=%u SPI_DATA=%u",
              s_runtime->transport == SLECG_TRANSPORT_UART ? "UART" : "BLE",
              (unsigned)ADS129X_SAMPLE_RATE_HZ,
              (unsigned)ADS129X_SPI_FREQ_DATA);
-    apply_uart_log_policy();
+
+    if (s_runtime->transport == SLECG_TRANSPORT_UART) {
+        ESP_LOGI(TAG, "UART 二进制边界：此行之后仅输出 ECG_DATA 帧");
+        slecg_uart_stream_flush();
+        slecg_uart_stream_logs_disable();
+    }
+
+    s_runtime->error_code = SLECG_ERR_NONE;
+    s_runtime->acq = SLECG_ACQ_RUNNING;
+
+    if (s_runtime->transport == SLECG_TRANSPORT_BLE) {
+        apply_uart_log_policy();
+    }
 
     if (from_ble) {
         send_ack(orig_type);
@@ -173,8 +190,10 @@ static void do_stop_acq(uint8_t orig_type, bool from_ble)
         return;
     }
 
-    ads_stop_hw();
+    /* 先阻止 ECG 任务继续读 SPI/写 UART，再停止 ADS。 */
     s_runtime->acq = SLECG_ACQ_IDLE;
+    vTaskDelay(pdMS_TO_TICKS(20));
+    ads_stop_hw();
     apply_uart_log_policy();
 
     if (from_ble) {

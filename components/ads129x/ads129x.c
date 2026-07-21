@@ -32,6 +32,7 @@ static const char *TAG = "ads129x";
 #define ADS129X_REFBUF_SETTLE_MS          100
 #define ADS129X_START_INIT_SETTLE_MS      10
 #define ADS129X_RESET_COMMAND_SETTLE_MS   100
+#define ADS129X_INIT_VERIFY_RETRIES       3
 #define ADS129X_START_GUARD_US            1000
 #define ADS129X_RDATAC_GUARD_US           10
 #define ADS129X_COMMAND_PRE_GUARD_US      100
@@ -55,6 +56,7 @@ typedef struct {
 static spi_device_handle_t s_spi_dev;
 static bool s_spi_bus_initialized;
 static uint32_t s_spi_freq_hz;
+static uint32_t s_invalid_rdatac_frames;
 
 static ads129x_hp_state_t s_hp_ch1 = { 0, 0 };
 #if ADS129X_HAS_CH2
@@ -92,6 +94,51 @@ static void ads129x_pwdn_set_inactive(void)
 	gpio_set_level(BOARD_ADS_PWDN_GPIO, 1);
 }
 
+/*
+ * /PWDN 低有效：采集期间必须由 ESP32-S3 持续输出高电平。
+ * 每次 SPI 设备重配置或采集启动前重新确认方向和电平，并用
+ * gpio_get_level() 读回 GPIO matrix 状态。这只能证明 ESP32 端的逻辑
+ * 状态，不能代替对 ADS1291 实际管脚电压的万用表测量。
+ */
+static int ads129x_pwdn_hold_high(const char *why)
+{
+	esp_err_t err;
+	int level;
+
+	gpio_hold_dis(BOARD_ADS_PWDN_GPIO);
+	gpio_sleep_sel_dis(BOARD_ADS_PWDN_GPIO);
+	/* 同时开启输入路径，否则 GPIO_MODE_OUTPUT 下 gpio_get_level()
+	 * 可能因输入使能关闭而固定返回 0，造成 PWDN 被拉低的假警报。 */
+	err = gpio_set_direction(BOARD_ADS_PWDN_GPIO, GPIO_MODE_INPUT_OUTPUT);
+	if (err != ESP_OK) {
+		ESP_LOGE(TAG, "PWDN[%s]: 配置 GPIO%d 输出失败: %s",
+			 (why != NULL) ? why : "-", (int)BOARD_ADS_PWDN_GPIO,
+			 esp_err_to_name(err));
+		return -EIO;
+	}
+
+	err = gpio_set_level(BOARD_ADS_PWDN_GPIO, 1);
+	if (err != ESP_OK) {
+		ESP_LOGE(TAG, "PWDN[%s]: GPIO%d 输出高电平失败: %s",
+			 (why != NULL) ? why : "-", (int)BOARD_ADS_PWDN_GPIO,
+			 esp_err_to_name(err));
+		return -EIO;
+	}
+
+	ads129x_delay_us(10);
+	level = gpio_get_level(BOARD_ADS_PWDN_GPIO);
+	if (level != 1) {
+		ESP_LOGE(TAG,
+			 "PWDN[%s]: GPIO%d 已命令输出高电平，但读回=%d（外部拉低/复用/硬件网络可疑）",
+			 (why != NULL) ? why : "-", (int)BOARD_ADS_PWDN_GPIO, level);
+		return -EIO;
+	}
+
+	ESP_LOGI(TAG, "PWDN[%s]: GPIO%d output=HIGH readback=%d (ADS 退出掉电)",
+		 (why != NULL) ? why : "-", (int)BOARD_ADS_PWDN_GPIO, level);
+	return 0;
+}
+
 static void ads129x_start_set_inactive(void)
 {
 	gpio_set_level(BOARD_ADS_START_GPIO, 0);
@@ -100,6 +147,11 @@ static void ads129x_start_set_inactive(void)
 static int ads129x_spi_set_frequency(uint32_t freq_hz)
 {
 	esp_err_t err;
+
+	/* 寄存器和数据阶段同频时不要反复 remove/add 设备。 */
+	if ((s_spi_dev != NULL) && (s_spi_freq_hz == freq_hz)) {
+		return 0;
+	}
 
 	if (s_spi_dev != NULL) {
 		err = spi_bus_remove_device(s_spi_dev);
@@ -114,6 +166,8 @@ static int ads129x_spi_set_frequency(uint32_t freq_hz)
 		.mode = 1,
 		.spics_io_num = BOARD_ADS_CS_GPIO,
 		.queue_size = 1,
+		.cs_ena_pretrans = 4,
+		.cs_ena_posttrans = 4,
 	};
 
 	err = spi_bus_add_device(ADS129X_SPI_HOST, &devcfg, &s_spi_dev);
@@ -122,22 +176,32 @@ static int ads129x_spi_set_frequency(uint32_t freq_hz)
 	}
 
 	s_spi_freq_hz = freq_hz;
+	/* SPI device remove/add 后重申 /PWDN，避免管脚复用状态影响 AFE。 */
+	if (ads129x_pwdn_hold_high("SPI重配置后") < 0) {
+		return -EIO;
+	}
 	return 0;
 }
 
 static int ads129x_spi_transceive(const uint8_t *tx_buf, uint8_t *rx_buf, size_t len)
 {
+	uint8_t discard[32] = { 0 };
 	spi_transaction_t trans = { 0 };
 
 	if (s_spi_dev == NULL) {
 		return -ENODEV;
 	}
+	if ((len == 0U) || (len > sizeof(discard))) {
+		return -EINVAL;
+	}
 
 	trans.length = len * 8U;
+	trans.rxlength = len * 8U;
 	trans.tx_buffer = tx_buf;
-	trans.rx_buffer = rx_buf;
+	/* 命令发送也提供 RX 缓冲，避免短传输下 NULL RX 的平台差异。 */
+	trans.rx_buffer = (rx_buf != NULL) ? rx_buf : discard;
 
-	if (spi_device_transmit(s_spi_dev, &trans) != ESP_OK) {
+	if (spi_device_polling_transmit(s_spi_dev, &trans) != ESP_OK) {
 		return -EIO;
 	}
 
@@ -187,7 +251,8 @@ int ads129x_init(void)
 			.max_transfer_sz = 32,
 		};
 
-		err = spi_bus_initialize(ADS129X_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO);
+		/* ADS1291 只使用 1~14 byte 短帧，禁用 DMA 避免短 RX 全 0。 */
+		err = spi_bus_initialize(ADS129X_SPI_HOST, &buscfg, SPI_DMA_DISABLED);
 		if (err != ESP_OK) {
 			ESP_LOGE(TAG, "SPI bus init failed: %s", esp_err_to_name(err));
 			return -EIO;
@@ -203,7 +268,8 @@ int ads129x_init(void)
 
 	gpio_config_t gpio_out = {
 		.pin_bit_mask = (1ULL << BOARD_ADS_START_GPIO) | (1ULL << BOARD_ADS_PWDN_GPIO),
-		.mode = GPIO_MODE_OUTPUT,
+		/* 保留输入路径，便于读回 START/PWDN 的管脚逻辑电平。 */
+		.mode = GPIO_MODE_INPUT_OUTPUT,
 		.pull_up_en = GPIO_PULLUP_DISABLE,
 		.pull_down_en = GPIO_PULLDOWN_DISABLE,
 		.intr_type = GPIO_INTR_DISABLE,
@@ -235,11 +301,55 @@ int ads129x_init(void)
 	ads129x_delay_ms(ADS129X_RESET_PULSE_MS);
 	ads129x_pwdn_set_inactive();
 	ads129x_delay_ms(ADS129X_RESET_SETTLE_MS);
+	if (ads129x_pwdn_hold_high("复位释放后") < 0) {
+		return -EIO;
+	}
 
-	ret = ads129x_configure_default();
-	if (ret < 0) {
-		ESP_LOGE(TAG, "register configure failed: %d", ret);
-		return ret;
+	/*
+	 * 只有 ID 和关键配置读回一致才允许进入采集。
+	 * 任一次失败后用 /PWDN + RESET opcode 重新同步 ADS/SPI。
+	 */
+	for (int attempt = 1; attempt <= ADS129X_INIT_VERIFY_RETRIES; ++attempt) {
+		memset(regs, 0, sizeof(regs));
+		ret = ads129x_configure_default();
+		if (ret == 0) {
+			ret = ads129x_rreg(ADS129X_REG_ID, sizeof(regs), regs);
+		}
+
+		if (ret == 0) {
+			ESP_LOGI(TAG,
+				 "寄存器校验(try %d): ID=%02X CONFIG1=%02X CONFIG2=%02X "
+				 "CH1SET=%02X CH2SET=%02X RLD=%02X LOFF_SENS=%02X",
+				 attempt, regs[0], regs[1], regs[2], regs[4], regs[5], regs[6], regs[7]);
+			ESP_LOG_BUFFER_HEX_LEVEL(TAG, regs, sizeof(regs), ESP_LOG_INFO);
+
+			if ((regs[0] == ADS129X_ID_DEFAULT) &&
+			    (regs[1] == ADS129X_CONFIG1_DEFAULT) &&
+			    (regs[2] == ADS129X_CONFIG2_DEFAULT) &&
+			    (regs[4] == ADS129X_CH1SET_DEFAULT) &&
+			    (regs[5] == ADS129X_CH2SET_DEFAULT) &&
+			    (regs[6] == ADS129X_RLD_SENS_DEFAULT) &&
+			    (regs[7] == ADS129X_LOFF_SENS_DEFAULT)) {
+				break;
+			}
+		}
+
+		ESP_LOGW(TAG, "ADS1291 SPI/寄存器校验失败 (try %d/%d, ret=%d)",
+			 attempt, ADS129X_INIT_VERIFY_RETRIES, ret);
+		if (attempt == ADS129X_INIT_VERIFY_RETRIES) {
+			ESP_LOGE(TAG, "ADS1291 初始化失败：未读到有效 ID=0x%02X 和关键配置",
+				 ADS129X_ID_DEFAULT);
+			return -EIO;
+		}
+
+		ads129x_pwdn_set_active();
+		ads129x_delay_ms(ADS129X_RESET_PULSE_MS);
+		if (ads129x_pwdn_hold_high("校验重试复位") < 0) {
+			return -EIO;
+		}
+		ads129x_delay_ms(ADS129X_RESET_SETTLE_MS);
+		(void)ads129x_send_command(ADS129X_CMD_RESET);
+		ads129x_delay_ms(ADS129X_RESET_COMMAND_SETTLE_MS);
 	}
 	ads129x_highpass_reset(ads129x_sample_rate_from_config1(ADS129X_CONFIG1_DEFAULT));
 	ads129x_notch_reset(ads129x_sample_rate_from_config1(ADS129X_CONFIG1_DEFAULT));
@@ -252,17 +362,7 @@ int ads129x_init(void)
 		 ADS129X_NOTCH_ENABLE, (double)ADS129X_NOTCH_FREQ_HZ,
 		 ADS129X_RLD_SENS_DEFAULT);
 
-	ret = ads129x_rreg(ADS129X_REG_ID, sizeof(regs), regs);
-	if (ret == 0) {
-		ESP_LOGI(TAG, "ADS129x ID: 0x%02x", regs[0]);
-		if (regs[0] != ADS129X_ID_DEFAULT) {
-			ESP_LOGW(TAG, "ADS129x ID differs from compile-time default: expected 0x%02x",
-				 ADS129X_ID_DEFAULT);
-		}
-		ESP_LOG_BUFFER_HEX_LEVEL(TAG, regs, sizeof(regs), ESP_LOG_INFO);
-	} else {
-		ESP_LOGW(TAG, "register dump failed: %d", ret);
-	}
+	ESP_LOGI(TAG, "ADS129x ID/config verified: ID=0x%02X", regs[0]);
 
 	ret = ads129x_spi_set_frequency(ADS129X_SPI_FREQ_DATA);
 	if (ret < 0) {
@@ -285,6 +385,7 @@ int ads129x_stop(void)
 	ads129x_delay_ms(1);
 	ret |= ads129x_send_command(ADS129X_CMD_SDATAC);
 	ads129x_start_set_inactive();
+	(void)ads129x_pwdn_hold_high("停止采集后");
 
 	ads129x_log_pins("stop后");
 	(void)ads129x_log_registers("stop后读回");
@@ -312,6 +413,18 @@ int ads129x_read_frame(ads129x_sample_t *sample)
 	}
 
 	memcpy(sample->status, rx_buf, sizeof(sample->status));
+	/* ADS129x RDATAC STATUS[23:20] 固定为 1100b。 */
+	if ((sample->status[0] & 0xF0U) != 0xC0U) {
+		s_invalid_rdatac_frames++;
+		if ((s_invalid_rdatac_frames <= 8U) ||
+		    ((s_invalid_rdatac_frames % ADS129X_SAMPLE_RATE_HZ) == 0U)) {
+			ESP_LOGE(TAG,
+				 "RDATAC STATUS 非法 #%lu: %02X %02X %02X（SPI空读/错位/DOUT异常）",
+				 (unsigned long)s_invalid_rdatac_frames,
+				 sample->status[0], sample->status[1], sample->status[2]);
+		}
+		return -EBADMSG;
+	}
 	memcpy(sample->raw_ch1, &rx_buf[3], sizeof(sample->raw_ch1));
 #if ADS129X_HAS_CH2
 	memcpy(sample->raw_ch2, &rx_buf[6], sizeof(sample->raw_ch2));
@@ -523,6 +636,10 @@ int ads129x_init_start(void)
 
 	ESP_LOGI(TAG, "init_start: 准备首次进入 RDATAC, spi=%lu Hz",
 		 (unsigned long)s_spi_freq_hz);
+	ret = ads129x_pwdn_hold_high("首次采集前");
+	if (ret < 0) {
+		return ret;
+	}
 	ads129x_log_pins("init_start前");
 
 	if (s_spi_freq_hz != ADS129X_SPI_FREQ_DATA) {
@@ -562,6 +679,10 @@ int ads129x_start(void)
 
 	ESP_LOGI(TAG, "start: 再次进入 RDATAC, spi=%lu Hz",
 		 (unsigned long)s_spi_freq_hz);
+	ret = ads129x_pwdn_hold_high("再次采集前");
+	if (ret < 0) {
+		return ret;
+	}
 	ads129x_log_pins("start前");
 
 	if (s_spi_freq_hz != ADS129X_SPI_FREQ_DATA) {

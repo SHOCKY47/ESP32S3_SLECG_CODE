@@ -13,6 +13,7 @@
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -33,6 +34,7 @@ static const char *TAG = "slecg_ecg";
 /* BLE 调试：前 N 次每样本都打；之后每 PERIOD 次打一条 */
 #define SLECG_BLE_DBG_FIRST_N       8
 #define SLECG_BLE_DBG_EVERY_N       25
+#define SLECG_SPI_RECOVERY_SAMPLES  25U
 
 static SemaphoreHandle_t s_drdy_sem;
 
@@ -86,6 +88,10 @@ static uint32_t now_ms(void)
 
 void slecg_ecg_reset_stats(void)
 {
+	if (s_drdy_sem != NULL) {
+		while (xSemaphoreTake(s_drdy_sem, 0) == pdTRUE) {
+		}
+	}
 	s_frames_sent = 0;
 	s_frames_fail = 0;
 	s_reads_ok = 0;
@@ -120,9 +126,9 @@ void slecg_ecg_log_stats(void)
  * 等待下一次转换完成（限速，避免空转灌串口）：
  * 1) 优先等 DRDY 下降沿
  * 2) DRDY 已为低（有未读数据）则立即读
- * 3) 超时仍无边沿：按采样周期强制读一次
+ * 3) 超时且 DRDY 仍为高：报告超时，本轮不读取 SPI
  */
-static void wait_next_sample(bool *from_timeout)
+static bool wait_next_sample(bool *from_timeout)
 {
 	const TickType_t period_ticks = pdMS_TO_TICKS(
 		(1000U + ADS129X_SAMPLE_RATE_HZ - 1U) / ADS129X_SAMPLE_RATE_HZ);
@@ -135,15 +141,17 @@ static void wait_next_sample(bool *from_timeout)
 
 	if (xSemaphoreTake(s_drdy_sem, wait_ticks) == pdTRUE) {
 		s_drdy_edge_hits++;
-		return;
+		/* 二值信号量可能保留一个旧事件；只有 DRDY 当前仍为低才读数。 */
+		return ads129x_is_data_ready();
 	}
 
 	if (ads129x_is_data_ready()) {
-		return;
+		return true;
 	}
 
 	s_drdy_timeouts++;
 	*from_timeout = true;
+	return false;
 }
 
 static void ble_debug_log_sample(const ads129x_sample_t *sample, bool from_timeout)
@@ -186,7 +194,10 @@ static void ecg_task(void *arg)
 	uint8_t last_loff = 0;
 	uint8_t frame[SLECG_ECG_FRAME_SIZE];
 	uint32_t first_ts = 0;
-	TickType_t last_read_tick = 0;
+	int64_t last_read_us = 0;
+	uint32_t consecutive_valid = 0;
+	const int64_t min_period_us =
+		(1000000LL + ADS129X_SAMPLE_RATE_HZ - 1LL) / ADS129X_SAMPLE_RATE_HZ;
 
 	(void)arg;
 
@@ -197,33 +208,54 @@ static void ecg_task(void *arg)
 		if (rt == NULL || rt->acq != SLECG_ACQ_RUNNING) {
 			sample_count = 0;
 			first_ts = 0;
-			last_read_tick = 0;
+			last_read_us = 0;
+			consecutive_valid = 0;
 			while (xSemaphoreTake(s_drdy_sem, 0) == pdTRUE) {
 			}
 			vTaskDelay(pdMS_TO_TICKS(20));
 			continue;
 		}
 
-		wait_next_sample(&from_timeout);
-
-		/* 额外限速：即使 DRDY 卡在低电平，也不超过标称采样率 */
-		{
-			const TickType_t min_period = pdMS_TO_TICKS(
-				(1000U + ADS129X_SAMPLE_RATE_HZ - 1U) / ADS129X_SAMPLE_RATE_HZ);
-			TickType_t now = xTaskGetTickCount();
-			if (last_read_tick != 0 && (now - last_read_tick) < min_period) {
-				vTaskDelay(min_period - (now - last_read_tick));
+		if (!wait_next_sample(&from_timeout)) {
+			if (from_timeout) {
+				slecg_fsm_set_error(SLECG_ERR_DRDY_TIMEOUT);
 			}
-			last_read_tick = xTaskGetTickCount();
+			continue;
+		}
+
+		/*
+		 * 用微秒时钟强制最小读取间隔。这不依赖 FreeRTOS tick，
+		 * 即使信号量或 DRDY 存在额外边沿，也不会超过 250 SPS。
+		 */
+		{
+			int64_t now_us = esp_timer_get_time();
+			if (last_read_us != 0) {
+				int64_t remaining_us = min_period_us - (now_us - last_read_us);
+				if (remaining_us > 0) {
+					esp_rom_delay_us((uint32_t)remaining_us);
+				}
+			}
+			last_read_us = esp_timer_get_time();
 		}
 
 		ads129x_sample_t sample;
 		if (ads129x_read_frame(&sample) != 0) {
 			s_reads_fail++;
+			consecutive_valid = 0;
 			slecg_fsm_set_error(SLECG_ERR_SPI);
 			continue;
 		}
 		s_reads_ok++;
+		consecutive_valid++;
+		if (consecutive_valid >= SLECG_SPI_RECOVERY_SAMPLES) {
+			const slecg_runtime_t *current = slecg_fsm_get_runtime();
+			if (current != NULL &&
+			    (current->error_code == SLECG_ERR_SPI ||
+			     current->error_code == SLECG_ERR_DRDY_TIMEOUT)) {
+				slecg_fsm_set_error(SLECG_ERR_NONE);
+			}
+			consecutive_valid = SLECG_SPI_RECOVERY_SAMPLES;
+		}
 
 		/* 保留原始 24bit 扩展值便于停止后诊断（是否真全 0） */
 		{
@@ -294,7 +326,8 @@ static void ecg_task(void *arg)
 
 void slecg_ecg_start(void)
 {
-	s_drdy_sem = xSemaphoreCreateCounting(8, 0);
+	/* 只需要表示“当前有一帧待读”，禁止 DRDY 事件积压后连续重复读取。 */
+	s_drdy_sem = xSemaphoreCreateBinary();
 	if (s_drdy_sem == NULL) {
 		ESP_LOGE(TAG, "DRDY 信号量创建失败");
 		return;

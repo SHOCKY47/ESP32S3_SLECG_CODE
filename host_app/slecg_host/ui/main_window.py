@@ -23,6 +23,8 @@ from slecg_host.ecg.buffer import EcgBuffer
 from slecg_host.ecg.converter import DisplayMode, EcgConverter
 from slecg_host.ecg.recorder import EcgRecorder
 from slecg_host.protocol.constants import (
+    SLECG_ECG_PAYLOAD_LEN,
+    SLECG_ECG_SAMPLES_PER_PKT,
     SLECG_TYPE_ACK,
     SLECG_TYPE_DEVICE_STATUS,
     SLECG_TYPE_ECG_DATA,
@@ -332,8 +334,30 @@ class MainWindow(QMainWindow):
             traceback.print_exc()
 
     def _dispatch_frame(self, frame_type: int, payload: bytes) -> None:
+        # UART 在采集阶段是 ECG-only 二进制通道。即使噪声/文本中
+        # 偶然出现伪帧头，也不接受 STATUS/ACK/未知类型。
+        if self._mode == TransportMode.SERIAL and frame_type != SLECG_TYPE_ECG_DATA:
+            logger.debug(
+                "UART ECG-only: 丢弃 TYPE=0x%02x len=%d", frame_type, len(payload)
+            )
+            return
+
         if frame_type == SLECG_TYPE_ECG_DATA:
+            if len(payload) != SLECG_ECG_PAYLOAD_LEN:
+                logger.warning(
+                    "丢弃非法 ECG 帧：payload=%d，期望=%d",
+                    len(payload),
+                    SLECG_ECG_PAYLOAD_LEN,
+                )
+                return
             pkt = parse_ecg_payload(payload)
+            if pkt.n_samples != SLECG_ECG_SAMPLES_PER_PKT or len(pkt.samples) != SLECG_ECG_SAMPLES_PER_PKT:
+                logger.warning(
+                    "丢弃非法 ECG 帧：n_samples=%d parsed=%d",
+                    pkt.n_samples,
+                    len(pkt.samples),
+                )
+                return
             self._ecg_packets += 1
             if self._ecg_packets == 1:
                 logger.info(
