@@ -19,6 +19,9 @@ const slecg_runtime_t *slecg_fsm_get_runtime(void);
 /** @brief 更新全局 error_code */
 void slecg_fsm_set_error(uint8_t error_code);
 
+/** @brief 由采样任务请求 FSM 停止并重启 ADS，重复请求会自动合并 */
+void slecg_fsm_request_ads_recovery(uint8_t error_code);
+
 /** @brief 查看当前 ECG 包序号（不递增） */
 uint16_t slecg_fsm_peek_ecg_seq(void);
 

@@ -13,6 +13,7 @@ typedef enum {
     SLECG_EVT_BLE_START,
     SLECG_EVT_BLE_STOP,
     SLECG_EVT_BLE_REQ_STATUS,
+    SLECG_EVT_ADS_RECOVER,
 } slecg_event_id_t;
 
 typedef struct {

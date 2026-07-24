@@ -22,9 +22,13 @@ static const char *TAG = "slecg_fsm";
 #define SLECG_FSM_TASK_STACK        4096
 #define SLECG_FSM_TASK_PRIO         6
 #define SLECG_FSM_QUEUE_LEN         16
+#define SLECG_ADS_START_ATTEMPTS    2
+#define SLECG_ADS_RECOVERY_MAX      3
 
 static QueueHandle_t s_event_queue;
 static slecg_runtime_t *s_runtime;
+static volatile bool s_recovery_pending;
+static uint8_t s_recovery_attempts;
 
 static void send_nack(uint8_t orig_type, uint8_t error)
 {
@@ -61,15 +65,23 @@ static void apply_uart_log_policy(void)
 
 static int ads_start_hw(void)
 {
-    int ret;
+    int ret = -1;
 
-    if (!s_runtime->ads_ever_started) {
-        ret = ads129x_init_start();
-    } else {
-        ret = ads129x_start();
-    }
-    if (ret == 0) {
-        s_runtime->ads_ever_started = true;
+    for (int attempt = 1; attempt <= SLECG_ADS_START_ATTEMPTS; ++attempt) {
+        if (!s_runtime->ads_ever_started) {
+            ret = ads129x_init_start();
+        } else {
+            ret = ads129x_start();
+        }
+        if (ret == 0) {
+            s_runtime->ads_ever_started = true;
+            return 0;
+        }
+
+        ESP_LOGW(TAG, "ADS 启动验证失败 (%d/%d), ret=%d，执行 STOP/SDATAC 后重试",
+                 attempt, SLECG_ADS_START_ATTEMPTS, ret);
+        ads129x_stop();
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
     return ret;
 }
@@ -132,6 +144,8 @@ static void do_start_acq(uint8_t orig_type, bool from_ble)
     (void)ads129x_log_registers("采集前");
 
     slecg_ecg_reset_stats();
+    s_recovery_attempts = 0;
+    s_recovery_pending = false;
     ret = ads_start_hw();
     if (ret != 0) {
         ESP_LOGE(TAG, "ADS 启动失败: %d", ret);
@@ -174,6 +188,58 @@ static void do_start_acq(uint8_t orig_type, bool from_ble)
     if (from_ble) {
         send_ack(orig_type);
     }
+}
+
+static void do_recover_ads(uint8_t cause)
+{
+    int ret;
+
+    s_recovery_pending = false;
+    if (s_runtime == NULL || s_runtime->acq != SLECG_ACQ_RUNNING) {
+        return;
+    }
+
+    s_runtime->acq = SLECG_ACQ_IDLE;
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    /* UART 二进制流已经暂停，此时恢复日志，便于上位机看到明确故障原因。 */
+    if (s_runtime->transport == SLECG_TRANSPORT_UART) {
+        slecg_uart_stream_logs_enable();
+    }
+
+    if (s_recovery_attempts >= SLECG_ADS_RECOVERY_MAX) {
+        ads_stop_hw();
+        s_runtime->error_code = cause;
+        ESP_LOGE(TAG, "ADS 自动恢复已达上限 %u 次，采集停止",
+                 (unsigned)SLECG_ADS_RECOVERY_MAX);
+        slecg_led_show_error_hint();
+        apply_uart_log_policy();
+        return;
+    }
+
+    s_recovery_attempts++;
+    ESP_LOGW(TAG, "ADS 自动恢复 %u/%u，触发错误=%u",
+             (unsigned)s_recovery_attempts,
+             (unsigned)SLECG_ADS_RECOVERY_MAX,
+             (unsigned)cause);
+
+    ads_stop_hw();
+    ret = ads_start_hw();
+    if (ret == 0) {
+        ESP_LOGI(TAG, "ADS 自动恢复成功，重新进入 ECG 二进制流");
+        if (s_runtime->transport == SLECG_TRANSPORT_UART) {
+            slecg_uart_stream_flush();
+            slecg_uart_stream_logs_disable();
+        }
+        s_runtime->error_code = SLECG_ERR_NONE;
+        s_runtime->acq = SLECG_ACQ_RUNNING;
+        return;
+    }
+
+    s_runtime->error_code = cause;
+    ESP_LOGE(TAG, "ADS 自动恢复失败 ret=%d，采集保持停止", ret);
+    slecg_led_show_error_hint();
+    apply_uart_log_policy();
 }
 
 static void do_stop_acq(uint8_t orig_type, bool from_ble)
@@ -256,6 +322,9 @@ static void handle_event(const slecg_event_t *evt)
     case SLECG_EVT_BLE_REQ_STATUS:
         slecg_status_send_once();
         break;
+    case SLECG_EVT_ADS_RECOVER:
+        do_recover_ads(evt->orig_type);
+        break;
     default:
         break;
     }
@@ -306,6 +375,25 @@ void slecg_fsm_set_error(uint8_t error_code)
 {
     if (s_runtime != NULL) {
         s_runtime->error_code = error_code;
+    }
+}
+
+void slecg_fsm_request_ads_recovery(uint8_t error_code)
+{
+    slecg_event_t evt = {
+        .id = SLECG_EVT_ADS_RECOVER,
+        .orig_type = error_code,
+    };
+
+    if (s_event_queue == NULL || s_runtime == NULL ||
+        s_runtime->acq != SLECG_ACQ_RUNNING || s_recovery_pending) {
+        return;
+    }
+
+    s_recovery_pending = true;
+    if (xQueueSend(s_event_queue, &evt, 0) != pdTRUE) {
+        s_recovery_pending = false;
+        s_runtime->error_code = SLECG_ERR_TX_QUEUE_FULL;
     }
 }
 

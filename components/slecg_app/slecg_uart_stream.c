@@ -25,6 +25,8 @@ static bool s_binary_prepared;
 
 void slecg_uart_stream_prepare_binary(void)
 {
+	/* 临时断连可能锁存 stdio 错误；重启采集前必须允许后续写入重试。 */
+	clearerr(stdout);
 	if (s_binary_prepared) {
 		return;
 	}
@@ -43,6 +45,9 @@ esp_err_t slecg_uart_stream_write(const uint8_t *data, size_t len)
 
 	slecg_uart_stream_prepare_binary();
 
+	if (ferror(stdout)) {
+		clearerr(stdout);
+	}
 	written = fwrite(data, 1, len, stdout);
 	if (written != len) {
 		return ESP_FAIL;

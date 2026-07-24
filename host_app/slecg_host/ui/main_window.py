@@ -80,9 +80,9 @@ _PARSER_STALL_BYTES = 65
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self._language = "zh"
-        self._theme = "dark"
-        self.setWindowTitle("SLECG 心电监护终端")
+        self._language = "en"
+        self._theme = "light"
+        self.setWindowTitle("SLECG ECG MONITOR")
         self.resize(1180, 760)
 
         self._converter = EcgConverter()
@@ -126,9 +126,9 @@ class MainWindow(QMainWindow):
         header_row = QHBoxLayout(header)
         header_row.setContentsMargins(18, 10, 18, 10)
         title_box = QVBoxLayout()
-        self._app_title = QLabel("SLECG 心电监护终端")
+        self._app_title = QLabel("SLECG ECG MONITOR")
         self._app_title.setObjectName("appTitle")
-        self._app_subtitle = QLabel("单导联生物电信号采集与分析系统")
+        self._app_subtitle = QLabel("SINGLE-LEAD BIOPOTENTIAL ACQUISITION & REVIEW")
         self._app_subtitle.setObjectName("appSubtitle")
         title_box.addWidget(self._app_title)
         title_box.addWidget(self._app_subtitle)
@@ -136,10 +136,10 @@ class MainWindow(QMainWindow):
         self._live_badge.setObjectName("systemBadge")
         self._heart_rate = QLabel("HR -- BPM")
         self._heart_rate.setObjectName("heartRateBadge")
-        self._language_btn = QPushButton("EN")
+        self._language_btn = QPushButton("中文")
         self._language_btn.setObjectName("languageButton")
         self._language_btn.setFixedWidth(72)
-        self._theme_btn = QPushButton("☀")
+        self._theme_btn = QPushButton("☾")
         self._theme_btn.setObjectName("themeButton")
         self._theme_btn.setFixedWidth(46)
         header_row.addLayout(title_box)

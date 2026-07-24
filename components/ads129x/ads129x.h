@@ -1050,7 +1050,8 @@
  * - ID:        由 ADS129X_CHIP 映射。
  * - CONFIG1:   由 ADS129X_SAMPLE_RATE_HZ 决定。
  * - CONFIG2:   0xF0，内部参考缓冲开启，4.033V 参考，导联脱落比较器开启。
- * - LOFF:      0x54，直流导联脱落检测，电流 22nA，阈值 90%/10%。
+ * - LOFF:      0x10，直流导联脱落检测，电流 6nA，阈值 95%/5%。
+ *              较小的注入电流可降低高阻干电极上的变化偏置，较宽阈值窗减少瞬时误报。
  * - CH1SET:    0x10，CH1 正常输入，PGA gain = 1（饱和排查用最低增益）。
  * - CH2SET:    0x81，当 ADS129X_CHIP 为 ADS1291 时，power-down + input short。
  * - RLD_SENS:  0x33，开启 RLD 和 RLD 脱落检测，CH1P/CH1N 参与 RLD 共模计算。
@@ -1064,7 +1065,7 @@
 #define ADS129X_ID_DEFAULT                        ADS129X_ID_FROM_CHIP(ADS129X_CHIP)
 #define ADS129X_CONFIG1_DEFAULT                   ADS129X_CONFIG1_FROM_SAMPLE_RATE(ADS129X_SAMPLE_RATE_HZ)
 #define ADS129X_CONFIG2_DEFAULT                   (ADS129X_CONFIG2_INTERNAL_REF_4V | ADS129X_CONFIG2_PDB_LOFF_COMP_ENABLED)
-#define ADS129X_LOFF_DEFAULT                      ADS129X_LOFF_DC(ADS129X_LOFF_COMP_TH_90_10, ADS129X_LOFF_CURRENT_22NA)
+#define ADS129X_LOFF_DEFAULT                      ADS129X_LOFF_DC(ADS129X_LOFF_COMP_TH_95_5, ADS129X_LOFF_CURRENT_6NA)
 #define ADS129X_CH1SET_DEFAULT                    ADS129X_CH1SET_NORMAL(ADS129X_CH1SET_GAIN_1)
 #define ADS129X_CH2SET_DEFAULT                    ADS129X_CH2SET_POWERDOWN_SHORT
 #define ADS129X_RLD_SENS_DEFAULT                  (ADS129X_RLD_LOFF_SENS_ENABLED | ADS129X_RLD_SENS_CH1_RLD)

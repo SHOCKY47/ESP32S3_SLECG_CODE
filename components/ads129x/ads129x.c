@@ -38,6 +38,8 @@ static const char *TAG = "ads129x";
 #define ADS129X_COMMAND_PRE_GUARD_US      100
 #define ADS129X_COMMAND_GUARD_US          1000
 #define ADS129X_DRDY_HIGH_TIMEOUT_CYCLE   1000
+#define ADS129X_START_VERIFY_TIMEOUT_MS   120
+#define ADS129X_START_VERIFY_POLL_US      50
 
 #define ADS129X_HP_ALPHA_Q 31
 
@@ -228,6 +230,7 @@ static int ads129x_spi_write(const uint8_t *tx_buf, size_t len)
 }
 
 static int ads129x_wait_drdy_inactive(void);
+static int ads129x_verify_started_stream(const char *why);
 static uint32_t ads129x_sample_rate_from_config1(uint8_t config1_rate);
 
 static void ads129x_highpass_reset(uint32_t sample_rate_hz);
@@ -334,14 +337,15 @@ int ads129x_init(void)
 
 		if (ret == 0) {
 			ESP_LOGI(TAG,
-				 "寄存器校验(try %d): ID=%02X CONFIG1=%02X CONFIG2=%02X "
+				 "寄存器校验(try %d): ID=%02X CONFIG1=%02X CONFIG2=%02X LOFF=%02X "
 				 "CH1SET=%02X CH2SET=%02X RLD=%02X LOFF_SENS=%02X",
-				 attempt, regs[0], regs[1], regs[2], regs[4], regs[5], regs[6], regs[7]);
+				 attempt, regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7]);
 			ESP_LOG_BUFFER_HEX_LEVEL(TAG, regs, sizeof(regs), ESP_LOG_INFO);
 
 			if ((regs[0] == ADS129X_ID_DEFAULT) &&
 			    (regs[1] == ADS129X_CONFIG1_DEFAULT) &&
 			    (regs[2] == ADS129X_CONFIG2_DEFAULT) &&
+			    (regs[3] == ADS129X_LOFF_DEFAULT) &&
 			    (regs[4] == ADS129X_CH1SET_DEFAULT) &&
 			    (regs[5] == ADS129X_CH2SET_DEFAULT) &&
 			    (regs[6] == ADS129X_RLD_SENS_DEFAULT) &&
@@ -695,6 +699,11 @@ int ads129x_init_start(void)
 
 	ads129x_log_pins("init_start后");
 	ads129x_log_drdy_activity(80);
+	ret = ads129x_verify_started_stream("首次启动");
+	if (ret < 0) {
+		ESP_LOGE(TAG, "init_start: 未获得有效 DRDY/首帧，ret=%d", ret);
+		return ret;
+	}
 	ESP_LOGI(TAG, "init_start: 完成");
 	return 0;
 }
@@ -737,6 +746,11 @@ int ads129x_start(void)
 
 	ads129x_log_pins("start后");
 	ads129x_log_drdy_activity(80);
+	ret = ads129x_verify_started_stream("再次启动");
+	if (ret < 0) {
+		ESP_LOGE(TAG, "start: 未获得有效 DRDY/首帧，ret=%d", ret);
+		return ret;
+	}
 	ESP_LOGI(TAG, "start: 完成");
 	return 0;
 }
@@ -1075,6 +1089,43 @@ static int ads129x_wait_drdy_inactive(void)
 	} while (timeout > 0);
 
 	return -ETIMEDOUT;
+}
+
+/*
+ * START/RDATAC 的 SPI 写入成功并不代表 ADC 已经开始转换。只有在限定时间内
+ * 观察到 DRDY 有效，并读到 STATUS[23:20] == 1100b 的完整首帧，才允许 FSM
+ * 进入 RUNNING。该首帧仅用于同步和验证，不发送给上位机。
+ */
+static int ads129x_verify_started_stream(const char *why)
+{
+	ads129x_sample_t sample = { 0 };
+	const int64_t deadline_us =
+		esp_timer_get_time() + ((int64_t)ADS129X_START_VERIFY_TIMEOUT_MS * 1000LL);
+	int ret;
+
+	while (!ads129x_is_data_ready()) {
+		if (esp_timer_get_time() >= deadline_us) {
+			ESP_LOGE(TAG, "启动验证[%s]: %dms 内未观察到 DRDY=LOW",
+				 (why != NULL) ? why : "-",
+				 ADS129X_START_VERIFY_TIMEOUT_MS);
+			return -ETIMEDOUT;
+		}
+		ads129x_delay_us(ADS129X_START_VERIFY_POLL_US);
+	}
+
+	ret = ads129x_read_frame(&sample);
+	if (ret < 0) {
+		ESP_LOGE(TAG, "启动验证[%s]: 首帧无效 ret=%d status=%02X %02X %02X",
+			 (why != NULL) ? why : "-", ret,
+			 sample.status[0], sample.status[1], sample.status[2]);
+		return ret;
+	}
+
+	s_invalid_rdatac_frames = 0;
+	ads129x_log_sample(&sample, why);
+	ESP_LOGI(TAG, "启动验证[%s]: DRDY 和首帧有效",
+		 (why != NULL) ? why : "-");
+	return 0;
 }
 
 int ads129x_rreg(uint8_t start_addr, uint8_t count, uint8_t *out_buf)

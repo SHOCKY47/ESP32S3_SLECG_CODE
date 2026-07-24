@@ -35,6 +35,19 @@ static const char *TAG = "slecg_ecg";
 #define SLECG_BLE_DBG_FIRST_N       8
 #define SLECG_BLE_DBG_EVERY_N       25
 #define SLECG_SPI_RECOVERY_SAMPLES  25U
+/* 连续约 300 ms 无 DRDY，或连续 8 帧 SPI 无效时，请求 FSM 重启 ADS。 */
+#define SLECG_DRDY_RECOVERY_TIMEOUTS 25U
+#define SLECG_SPI_RECOVERY_FAILURES   8U
+/*
+ * 干电极刚接触或受压变化时，lead-off 比较器可能短暂跳变。
+ * 脱落需连续 300 ms 确认，恢复需连续 500 ms 确认，避免单点状态直接上报。
+ */
+#define SLECG_LOFF_ASSERT_MS         300U
+#define SLECG_LOFF_CLEAR_MS          500U
+#define SLECG_MS_TO_SAMPLES(ms) \
+	(((ms) * ADS129X_SAMPLE_RATE_HZ + 999U) / 1000U)
+#define SLECG_LOFF_ASSERT_SAMPLES    SLECG_MS_TO_SAMPLES(SLECG_LOFF_ASSERT_MS)
+#define SLECG_LOFF_CLEAR_SAMPLES     SLECG_MS_TO_SAMPLES(SLECG_LOFF_CLEAR_MS)
 
 static SemaphoreHandle_t s_drdy_sem;
 
@@ -44,10 +57,54 @@ static uint32_t s_reads_ok;
 static uint32_t s_reads_fail;
 static uint32_t s_drdy_timeouts;
 static uint32_t s_drdy_edge_hits;
+static uint32_t s_recovery_requests;
 static uint32_t s_nonzero_samples;
 static int32_t s_last_raw32;
 static int16_t s_last_ch1;
 static uint8_t s_last_status[3];
+
+typedef struct {
+	uint8_t stable;
+	uint8_t candidate;
+	uint32_t count;
+} slecg_loff_filter_t;
+
+static void loff_filter_reset(slecg_loff_filter_t *filter)
+{
+	filter->stable = 0;
+	filter->candidate = 0;
+	filter->count = 0;
+}
+
+static uint8_t loff_filter_step(slecg_loff_filter_t *filter, uint8_t raw)
+{
+	const uint32_t required = (raw == 0U)
+		? SLECG_LOFF_CLEAR_SAMPLES
+		: SLECG_LOFF_ASSERT_SAMPLES;
+
+	if (raw == filter->stable) {
+		filter->candidate = raw;
+		filter->count = 0;
+		return filter->stable;
+	}
+
+	if (raw != filter->candidate) {
+		filter->candidate = raw;
+		filter->count = 1;
+	} else if (filter->count < required) {
+		filter->count++;
+	}
+
+	if (filter->count >= required) {
+		uint8_t previous = filter->stable;
+		filter->stable = raw;
+		filter->count = 0;
+		ESP_LOGI(TAG, "导联状态稳定变化: 0x%02X -> 0x%02X (raw=0x%02X)",
+			 previous, filter->stable, raw);
+	}
+
+	return filter->stable;
+}
 
 static void IRAM_ATTR drdy_isr_handler(void *arg)
 {
@@ -98,6 +155,7 @@ void slecg_ecg_reset_stats(void)
 	s_reads_fail = 0;
 	s_drdy_timeouts = 0;
 	s_drdy_edge_hits = 0;
+	s_recovery_requests = 0;
 	s_nonzero_samples = 0;
 	s_last_raw32 = 0;
 	s_last_ch1 = 0;
@@ -109,6 +167,7 @@ void slecg_ecg_log_stats(void)
 	ESP_LOGI(TAG,
 		 "ECG统计: 读成功=%lu 读失败=%lu 帧发送=%lu 帧失败=%lu "
 		 "DRDY边沿=%lu DRDY超时强制读=%lu 非零样本=%lu "
+		 "恢复请求=%lu "
 		 "last_status=%02X%02X%02X last_raw32=%ld last_ch1=%d",
 		 (unsigned long)s_reads_ok,
 		 (unsigned long)s_reads_fail,
@@ -117,6 +176,7 @@ void slecg_ecg_log_stats(void)
 		 (unsigned long)s_drdy_edge_hits,
 		 (unsigned long)s_drdy_timeouts,
 		 (unsigned long)s_nonzero_samples,
+		 (unsigned long)s_recovery_requests,
 		 s_last_status[0], s_last_status[1], s_last_status[2],
 		 (long)s_last_raw32,
 		 (int)s_last_ch1);
@@ -196,6 +256,9 @@ static void ecg_task(void *arg)
 	uint32_t first_ts = 0;
 	int64_t last_read_us = 0;
 	uint32_t consecutive_valid = 0;
+	uint32_t consecutive_drdy_timeouts = 0;
+	uint32_t consecutive_read_failures = 0;
+	slecg_loff_filter_t loff_filter = { 0 };
 	const int64_t min_period_us =
 		(1000000LL + ADS129X_SAMPLE_RATE_HZ - 1LL) / ADS129X_SAMPLE_RATE_HZ;
 
@@ -210,6 +273,9 @@ static void ecg_task(void *arg)
 			first_ts = 0;
 			last_read_us = 0;
 			consecutive_valid = 0;
+			consecutive_drdy_timeouts = 0;
+			consecutive_read_failures = 0;
+			loff_filter_reset(&loff_filter);
 			while (xSemaphoreTake(s_drdy_sem, 0) == pdTRUE) {
 			}
 			vTaskDelay(pdMS_TO_TICKS(20));
@@ -219,9 +285,17 @@ static void ecg_task(void *arg)
 		if (!wait_next_sample(&from_timeout)) {
 			if (from_timeout) {
 				slecg_fsm_set_error(SLECG_ERR_DRDY_TIMEOUT);
+				consecutive_drdy_timeouts++;
+				if (consecutive_drdy_timeouts >= SLECG_DRDY_RECOVERY_TIMEOUTS) {
+					s_recovery_requests++;
+					slecg_fsm_request_ads_recovery(SLECG_ERR_DRDY_TIMEOUT);
+					consecutive_drdy_timeouts = 0;
+					consecutive_read_failures = 0;
+				}
 			}
 			continue;
 		}
+		consecutive_drdy_timeouts = 0;
 
 		/*
 		 * 用微秒时钟强制最小读取间隔。这不依赖 FreeRTOS tick，
@@ -242,10 +316,18 @@ static void ecg_task(void *arg)
 		if (ads129x_read_frame(&sample) != 0) {
 			s_reads_fail++;
 			consecutive_valid = 0;
+			consecutive_read_failures++;
 			slecg_fsm_set_error(SLECG_ERR_SPI);
+			if (consecutive_read_failures >= SLECG_SPI_RECOVERY_FAILURES) {
+				s_recovery_requests++;
+				slecg_fsm_request_ads_recovery(SLECG_ERR_SPI);
+				consecutive_read_failures = 0;
+				consecutive_drdy_timeouts = 0;
+			}
 			continue;
 		}
 		s_reads_ok++;
+		consecutive_read_failures = 0;
 		consecutive_valid++;
 		if (consecutive_valid >= SLECG_SPI_RECOVERY_SAMPLES) {
 			const slecg_runtime_t *current = slecg_fsm_get_runtime();
@@ -280,7 +362,7 @@ static void ecg_task(void *arg)
 			first_ts = now_ms();
 		}
 		sample_buf[sample_count] = sample.ch1_value;
-		last_loff = sample.loff_status;
+		last_loff = loff_filter_step(&loff_filter, sample.loff_status);
 		sample_count++;
 
 		if (sample_count < SLECG_ECG_SAMPLES_PER_PKT) {
